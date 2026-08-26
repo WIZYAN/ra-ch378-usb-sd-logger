@@ -1,0 +1,11 @@
+LaunchTargetManager/configs/CH378.elf=null\:---
+LaunchTargetManager/configs/usb\ Debug_Flat=null\:---
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=win32
+com.renesas.cdt.launch.dsf.launching.gdbLocalLaunchDescriptorType\:CH378.elf/activeLaunchMode=debug
+com.renesas.cdt.launch.dsf.launching.gdbLocalLaunchDescriptorType\:CH378.elf/activeLaunchTarget=null\:---
+com.renesas.cdt.launch.dsf.launching.gdbLocalLaunchDescriptorType\:usb\ Debug_Flat/activeLaunchMode=debug
+com.renesas.cdt.launch.dsf.launching.gdbLocalLaunchDescriptorType\:usb\ Debug_Flat/activeLaunchTarget=null\:---
+configDescList=com.renesas.cdt.launch.dsf.launching.gdbLocalLaunchDescriptorType\:usb Debug_Flat,com.renesas.cdt.launch.dsf.launching.gdbLocalLaunchDescriptorType\:CH378.elf
+eclipse.preferences.version=1

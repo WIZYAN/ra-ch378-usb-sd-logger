@@ -1,0 +1,373 @@
+#include "hal_data.h"
+#include "ch378_storage.h"
+#include "app_hmi.h"
+
+#include <stdio.h>
+
+/*
+ * 本文件是应用层入口，负责协调串口屏、CH378 存储和查询流程。
+ * 主循环采用阻塞式顺序执行：查询请求优先于 RTC 写入，查询结束后恢复 RTC 轮询和连续记录。
+ * CH378 文件接口和串口屏发送接口均不能在中断回调中调用。
+ */
+
+#define APP_STORAGE_DEVICE          CH378_STORAGE_USB // 当前选择 U盘，改为 CH378_STORAGE_SD 可选择 SD 卡
+#define DEMO_READ_BUFFER_SIZE       1024U             // 单个分钟文件的末尾读取缓冲区长度
+#define DEMO_QUERY_LOOP_DELAY_MS    10U               // 主循环相邻两次输入处理的间隔，单位：毫秒
+#define DEMO_FILE_NOT_FOUND_RESULT  0x42U             // CH378 文件未找到返回码
+#define DEMO_QUERY_RECORD_COUNT     10U               // 单次查询最多显示的有效记录数量
+#define DEMO_QUERY_MAX_MINUTES      1440U             // 单次查询最多向前回溯的分钟数量
+#define DEMO_RTC_POLL_LOOP_COUNT    30U               // 每 30 次主循环请求一次 RTC，约 300 毫秒
+#define DEMO_WRITE_DATA_LENGTH      64U               // RTC 连续写入参数字符串缓冲区长度
+
+typedef struct
+{
+    uint8_t query_read_buffer[DEMO_READ_BUFFER_SIZE]; // 保存当前查询文件的读取数据
+    uint16_t query_read_length; // 保存当前查询文件的实际读取长度
+    HMI_Query_Time query_time; // 保存本次按钮查询使用的年月日时分
+    HMI_Query_Time search_time; // 保存跨文件回溯时当前检查的年月日时分
+    uint16_t checked_minutes; // 保存本次查询已经检查的分钟文件数量
+    uint8_t displayed_count; // 保存本次查询已经显示的有效记录数量
+    uint8_t added_count; // 保存当前分钟文件新显示的有效记录数量
+} CH378_Demo_Read_State; // 当前查询的数据、长度和时间状态
+
+typedef struct
+{
+    HMI_RTC_Time current_time; // 保存串口屏最近一次返回的 RTC 时间
+    HMI_RTC_Time last_write_time; // 保存最近一次成功写入使用的完整时间
+    uint16_t poll_loop_count; // 保存 RTC 读取请求的主循环计数
+    uint8_t last_write_time_valid; // 最近一次成功写入时间是否有效
+    uint8_t parameter_value; // 保存 0 至 255 循环递增的测试参数
+    char write_data[DEMO_WRITE_DATA_LENGTH]; // 保存当前待写入的三个参数字符串
+} CH378_Demo_RTC_State; // 串口屏 RTC 轮询和连续写入状态
+
+typedef struct
+{
+    uint8_t rtc_write_result; // 保存最近一次 RTC 记录写入结果
+    uint8_t query_read_result; // 保存最近一次屏幕查询的文件读取结果
+    uint32_t rtc_write_count; // 保存 RTC 记录累计成功写入次数
+    fsp_err_t hmi_init_result; // 保存串口屏初始化结果
+    fsp_err_t rtc_request_result; // 保存最近一次 RTC 时间请求发送结果
+    fsp_err_t hmi_clear_result; // 保存最近一次查询的表格清除结果
+    fsp_err_t hmi_query_display_result; // 保存最近一次查询的表格显示结果
+    HMI_Query_Status query_status; // 保存最近一次查询的执行状态
+} CH378_Demo_Result_State; // RTC 连续写入和屏幕查询结果状态
+
+CH378_Demo_Read_State g_ch378_demo_read_state; // 保存当前屏幕查询使用的数据
+CH378_Demo_RTC_State g_ch378_demo_rtc_state; // 保存串口屏 RTC 和连续写入状态
+
+CH378_Demo_Result_State g_ch378_demo_result_state =
+{
+    .rtc_write_result = 0xFFU, // RTC 记录写入接口尚未执行
+    .query_read_result = 0xFFU, // 屏幕查询读取接口尚未执行
+    .hmi_init_result = FSP_ERR_NOT_OPEN, // 串口屏初始化接口尚未执行
+    .rtc_request_result = FSP_ERR_NOT_OPEN, // RTC 时间请求接口尚未执行
+    .hmi_clear_result = FSP_ERR_NOT_OPEN, // 表格清除接口尚未执行
+    .hmi_query_display_result = FSP_ERR_NOT_OPEN, // 查询结果显示接口尚未执行
+    .query_status = HMI_QUERY_STATUS_WAITING // 尚未执行屏幕查询
+}; // 保存 RTC 连续写入和屏幕查询的接口返回结果
+
+FSP_CPP_HEADER
+void R_BSP_WarmStart(bsp_warm_start_event_t event);
+FSP_CPP_FOOTER
+
+/*
+ * 说明：计算指定年月对应月份的天数，并处理闰年二月。
+ * 输入：year：年；month：月。
+ * 输出：返回指定月份的天数。
+ */
+static uint8_t demo_days_in_month(uint16_t year, uint8_t month)
+{
+    uint8_t days;
+
+    if((month == 4U) || (month == 6U) || (month == 9U) || (month == 11U))
+    {
+        days = 30U;
+    }
+    else if(month == 2U)
+    {
+        days = 28U;
+        if((((year % 4U) == 0U) && ((year % 100U) != 0U)) || ((year % 400U) == 0U))
+        {
+            days = 29U;
+        }
+    }
+    else
+    {
+        days = 31U;
+    }
+
+    return days;
+}
+
+/*
+ * 说明：把查询时间向前移动一分钟，并正确处理小时、日期、月份和年份边界。
+ * 输入：time：需要向前移动的查询时间地址。
+ * 输出：成功返回 1，到达支持年份下限或参数无效返回 0。
+ */
+static uint8_t demo_time_decrement_minute(HMI_Query_Time *time)
+{
+    if((time == NULL) || (time->year <= 1980U))
+    {
+        return 0U;
+    }
+    if(time->minute > 0U)
+    {
+        time->minute--;
+        return 1U;
+    }
+
+    time->minute = 59U;
+    if(time->hour > 0U)
+    {
+        time->hour--;
+        return 1U;
+    }
+
+    time->hour = 23U;
+    if(time->day > 1U)
+    {
+        time->day--;
+        return 1U;
+    }
+
+    if(time->month > 1U)
+    {
+        time->month--;
+    }
+    else
+    {
+        time->year--;
+        time->month = 12U;
+    }
+    time->day = demo_days_in_month(time->year, time->month);
+    return 1U;
+}
+
+/*
+ * 说明：比较两组串口屏 RTC 时间的年月日时分秒是否完全相同。
+ * 输入：left_time：第一组 RTC 时间；right_time：第二组 RTC 时间。
+ * 输出：两组时间完全相同返回 1，否则返回 0。
+ */
+static uint8_t demo_rtc_time_is_equal(const HMI_RTC_Time *left_time,
+                                      const HMI_RTC_Time *right_time)
+{
+    if((left_time == NULL) || (right_time == NULL))
+    {
+        return 0U;
+    }
+
+    return (uint8_t) ((left_time->year == right_time->year) &&
+                      (left_time->month == right_time->month) &&
+                      (left_time->day == right_time->day) &&
+                      (left_time->hour == right_time->hour) &&
+                      (left_time->minute == right_time->minute) &&
+                      (left_time->second == right_time->second));
+}
+
+/*
+ * 说明：初始化串口屏和存储介质，根据串口屏 RTC 每秒写入记录，并处理最近十条记录查询。
+ * 输入：无。
+ * 输出：无。
+ */
+void hal_entry(void)
+{
+    uint8_t maximum_second;
+    uint8_t remaining_count;
+    int write_data_length;
+
+    g_ch378_demo_result_state.hmi_init_result = app_hmi_init(); // 屏幕失败不阻止 CH378 初始化，便于分别排查两个模块
+
+    if(ch378_storage_config(APP_STORAGE_DEVICE) != CH378_STORAGE_SUCCESS) // 0 选择 U盘，1 选择 SD 卡
+    {
+        while(1) // 存储介质选择无效或 CH378 通信失败，停止运行以避免后续无效读写
+        {
+        }
+    }
+
+    if(g_ch378_demo_result_state.hmi_init_result == FSP_SUCCESS)
+    {
+        g_ch378_demo_result_state.rtc_request_result = app_hmi_request_rtc_time();
+    }
+
+    while(1)
+    {
+        app_hmi_process_input(); // 解析中断已接收的 RTC 帧和 ID2 至 ID6 文本控件数据帧
+
+        if((g_ch378_demo_result_state.hmi_init_result == FSP_SUCCESS) &&
+           (app_hmi_take_query_request(&g_ch378_demo_read_state.query_time) != 0U))
+        {
+            // 查询为一次性阻塞操作，执行期间暂停按秒写入；查询结束后重新请求最新 RTC 时间
+            g_ch378_demo_result_state.query_status = HMI_QUERY_STATUS_QUERYING;
+            g_ch378_demo_result_state.hmi_clear_result = app_hmi_clear_storage_records();
+            g_ch378_demo_result_state.hmi_query_display_result = FSP_ERR_NOT_OPEN;
+            g_ch378_demo_read_state.search_time = g_ch378_demo_read_state.query_time;
+            g_ch378_demo_read_state.displayed_count = 0U;
+
+            for(g_ch378_demo_read_state.checked_minutes = 0U;
+                (g_ch378_demo_read_state.checked_minutes < DEMO_QUERY_MAX_MINUTES) &&
+                (g_ch378_demo_read_state.displayed_count < DEMO_QUERY_RECORD_COUNT);
+                g_ch378_demo_read_state.checked_minutes++)
+            {
+                g_ch378_demo_result_state.query_read_result = ch378_storage_read(
+                        g_ch378_demo_read_state.search_time.year,
+                        g_ch378_demo_read_state.search_time.month,
+                        g_ch378_demo_read_state.search_time.day,
+                        g_ch378_demo_read_state.search_time.hour,
+                        g_ch378_demo_read_state.search_time.minute,
+                        g_ch378_demo_read_state.query_read_buffer,
+                        sizeof(g_ch378_demo_read_state.query_read_buffer),
+                        &g_ch378_demo_read_state.query_read_length);
+
+                if(g_ch378_demo_result_state.query_read_result == CH378_STORAGE_SUCCESS)
+                {
+                    // 输入时间以该分钟 00 秒为截止点；更早的分钟文件允许显示 00 至 59 秒
+                    maximum_second = (g_ch378_demo_read_state.checked_minutes == 0U) ? 0U : 59U;
+                    remaining_count = (uint8_t) (DEMO_QUERY_RECORD_COUNT -
+                                                 g_ch378_demo_read_state.displayed_count);
+                    g_ch378_demo_result_state.hmi_query_display_result =
+                            app_hmi_display_storage_records(
+                                    g_ch378_demo_read_state.query_read_buffer,
+                                    maximum_second,
+                                    remaining_count,
+                                    &g_ch378_demo_read_state.added_count);
+                    if(g_ch378_demo_result_state.hmi_query_display_result != FSP_SUCCESS)
+                    {
+                        break;
+                    }
+                    g_ch378_demo_read_state.displayed_count =
+                            (uint8_t) (g_ch378_demo_read_state.displayed_count +
+                                      g_ch378_demo_read_state.added_count);
+                }
+                else if(g_ch378_demo_result_state.query_read_result != DEMO_FILE_NOT_FOUND_RESULT)
+                {
+                    // 文件不存在表示该分钟无记录，可以继续回溯；其他错误表示介质异常，立即结束
+                    break;
+                }
+
+                if((g_ch378_demo_read_state.displayed_count < DEMO_QUERY_RECORD_COUNT) &&
+                   (demo_time_decrement_minute(&g_ch378_demo_read_state.search_time) == 0U))
+                {
+                    break;
+                }
+            }
+
+            // 按显示错误、读取错误、无数据、成功的优先级保存最终状态，便于调试器直接观察
+            if(g_ch378_demo_result_state.hmi_clear_result != FSP_SUCCESS)
+            {
+                g_ch378_demo_result_state.query_status = HMI_QUERY_STATUS_DISPLAY_ERROR;
+            }
+            else if((g_ch378_demo_result_state.hmi_query_display_result != FSP_SUCCESS) &&
+                    (g_ch378_demo_result_state.hmi_query_display_result != FSP_ERR_NOT_OPEN))
+            {
+                g_ch378_demo_result_state.query_status = HMI_QUERY_STATUS_DISPLAY_ERROR;
+            }
+            else if((g_ch378_demo_result_state.query_read_result != CH378_STORAGE_SUCCESS) &&
+                    (g_ch378_demo_result_state.query_read_result != DEMO_FILE_NOT_FOUND_RESULT))
+            {
+                g_ch378_demo_result_state.query_status = HMI_QUERY_STATUS_READ_ERROR;
+            }
+            else if(g_ch378_demo_read_state.displayed_count == 0U)
+            {
+                g_ch378_demo_result_state.query_status = HMI_QUERY_STATUS_NO_DATA;
+            }
+            else
+            {
+                g_ch378_demo_result_state.query_status = HMI_QUERY_STATUS_SUCCESS;
+            }
+
+            (void) app_hmi_take_rtc_time(&g_ch378_demo_rtc_state.current_time); // 丢弃查询期间滞留的旧时间，避免补写过期记录
+            g_ch378_demo_result_state.rtc_request_result = app_hmi_request_rtc_time();
+            g_ch378_demo_rtc_state.poll_loop_count = 0U;
+        }
+        else if(app_hmi_take_rtc_time(&g_ch378_demo_rtc_state.current_time) != 0U)
+        {
+            // 完整时间与上次成功写入不同才记录，避免同一秒内重复写入
+            if((g_ch378_demo_rtc_state.last_write_time_valid == 0U) ||
+               (demo_rtc_time_is_equal(&g_ch378_demo_rtc_state.current_time,
+                                       &g_ch378_demo_rtc_state.last_write_time) == 0U))
+            {
+                write_data_length = snprintf(g_ch378_demo_rtc_state.write_data,
+                                             sizeof(g_ch378_demo_rtc_state.write_data),
+                                             "temperature=%u;humidity=%u;pressure=%u",
+                                             (unsigned int) g_ch378_demo_rtc_state.parameter_value,
+                                             (unsigned int) g_ch378_demo_rtc_state.parameter_value,
+                                             (unsigned int) g_ch378_demo_rtc_state.parameter_value);
+                if((write_data_length < 0) ||
+                   ((size_t) write_data_length >= sizeof(g_ch378_demo_rtc_state.write_data)))
+                {
+                    g_ch378_demo_result_state.rtc_write_result = 0x03U;
+                }
+                else
+                {
+                    g_ch378_demo_result_state.rtc_write_result = ch378_storage_write(
+                            g_ch378_demo_rtc_state.current_time.year,
+                            g_ch378_demo_rtc_state.current_time.month,
+                            g_ch378_demo_rtc_state.current_time.day,
+                            g_ch378_demo_rtc_state.current_time.hour,
+                            g_ch378_demo_rtc_state.current_time.minute,
+                            g_ch378_demo_rtc_state.current_time.second,
+                            g_ch378_demo_rtc_state.write_data);
+                    if(g_ch378_demo_result_state.rtc_write_result == CH378_STORAGE_SUCCESS)
+                    {
+                        g_ch378_demo_rtc_state.last_write_time = g_ch378_demo_rtc_state.current_time;
+                        g_ch378_demo_rtc_state.last_write_time_valid = 1U;
+                        g_ch378_demo_rtc_state.parameter_value++; // uint8_t 从 255 自然回绕到 0
+                        g_ch378_demo_result_state.rtc_write_count++;
+                    }
+                }
+            }
+        }
+
+        g_ch378_demo_rtc_state.poll_loop_count++; // 约 300 ms 轮询一次，阻塞读写会使实际间隔相应延长
+        if(g_ch378_demo_rtc_state.poll_loop_count >= DEMO_RTC_POLL_LOOP_COUNT)
+        {
+            g_ch378_demo_rtc_state.poll_loop_count = 0U;
+            if(g_ch378_demo_result_state.hmi_init_result == FSP_SUCCESS)
+            {
+                g_ch378_demo_result_state.rtc_request_result = app_hmi_request_rtc_time();
+            }
+        }
+
+        R_BSP_SoftwareDelay(DEMO_QUERY_LOOP_DELAY_MS, BSP_DELAY_UNITS_MILLISECONDS); // 限制主循环查询输入处理频率
+    }
+#if BSP_TZ_SECURE_BUILD
+    R_BSP_NonSecureEnter(); // 进入非安全代码
+#endif
+}
+
+/*
+ * 说明：在系统启动的不同阶段完成数据闪存和引脚初始化。
+ * 输入：event：当前系统启动阶段。
+ * 输出：无。
+ */
+void R_BSP_WarmStart(bsp_warm_start_event_t event)
+{
+    if (BSP_WARM_START_RESET == event)
+    {
+#if BSP_FEATURE_FLASH_LP_VERSION != 0
+
+        R_FACI_LP->DFLCTL = 1U; // 允许读取数据闪存
+        // C 运行环境初始化时间通常超过 6 us，因此这里不再单独等待数据闪存恢复
+#endif
+    }
+
+    if (BSP_WARM_START_POST_C == event)
+    {
+        R_IOPORT_Open (&g_ioport_ctrl, g_ioport.p_cfg); // C 运行环境和系统时钟就绪后配置引脚
+    }
+}
+
+#if BSP_TZ_SECURE_BUILD
+
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ();
+
+/*
+ * 说明：为 TrustZone 安全工程提供非安全可调用入口占位函数。
+ * 输入：无。
+ * 输出：无。
+ */
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ()
+{
+
+}
+#endif

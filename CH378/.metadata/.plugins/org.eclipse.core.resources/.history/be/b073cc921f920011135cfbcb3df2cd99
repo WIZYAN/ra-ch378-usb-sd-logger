@@ -1,0 +1,133 @@
+#include "hal_data.h"
+#include "ch378_storage.h"
+
+#define APP_STORAGE_DEVICE    CH378_STORAGE_USB // 验证 SD 卡时改为 CH378_STORAGE_SD
+#define DEMO_READ_BUFFER_SIZE 256U
+
+typedef struct
+{
+    uint8_t read_buffer_45[DEMO_READ_BUFFER_SIZE]; // 保存 16:45 对应文件的读取数据
+    uint8_t read_buffer_46[DEMO_READ_BUFFER_SIZE]; // 保存 16:46 对应文件的读取数据
+    uint16_t read_length_45;                       // 保存 16:45 对应文件的实际读取长度
+    uint16_t read_length_46;                       // 保存 16:46 对应文件的实际读取长度
+} CH378_Demo_Read_State;                           // 两组文件的读取数据和长度状态
+
+typedef struct
+{
+    uint8_t write_result_45; // 保存 16:45 对应文件的写入结果
+    uint8_t write_result_46; // 保存 16:46 对应文件的写入结果
+    uint8_t read_result_45;  // 保存 16:45 对应文件的读取结果
+    uint8_t read_result_46;  // 保存 16:46 对应文件的读取结果
+} CH378_Demo_Result_State;   // 两组文件的读写接口返回结果状态
+
+CH378_Demo_Read_State g_ch378_demo_read_state; // 保存两组文件的读取数据和实际长度
+
+CH378_Demo_Result_State g_ch378_demo_result_state =
+{
+    .write_result_45 = 0xFFU, // 16:45 对应文件的写入接口尚未执行
+    .write_result_46 = 0xFFU, // 16:46 对应文件的写入接口尚未执行
+    .read_result_45 = 0xFFU,  // 16:45 对应文件的读取接口尚未执行
+    .read_result_46 = 0xFFU   // 16:46 对应文件的读取接口尚未执行
+}; // 保存两组文件的读写接口返回结果
+
+FSP_CPP_HEADER
+void R_BSP_WarmStart(bsp_warm_start_event_t event);
+FSP_CPP_FOOTER
+
+/*
+ * 说明：完成存储介质配置，并执行两组文件写入和读回示例。
+ * 输入：无。
+ * 输出：无。
+ */
+void hal_entry(void)
+{
+    if(ch378_storage_config(APP_STORAGE_DEVICE) != CH378_STORAGE_SUCCESS) // 0 选择 U盘，1 选择 SD 卡
+    {
+        while(1) // 存储介质选择无效或 CH378 初始化失败
+        {
+        }
+    }
+
+    // 配置完成后写入两个文件，再按相同年月日时分分别读回
+    // 读写接口内部会自动检测并挂载当前介质
+    g_ch378_demo_result_state.write_result_45 = ch378_storage_write(2026U,
+                                                                    8U,
+                                                                    6U,
+                                                                    16U,
+                                                                    45U,
+                                                                    "temperature=20.22;humidity=45.60;pressure=101.30");
+    if(g_ch378_demo_result_state.write_result_45 == CH378_STORAGE_SUCCESS)
+    {
+        g_ch378_demo_result_state.read_result_45 = ch378_storage_read(2026U,
+                                                                      8U,
+                                                                      6U,
+                                                                      16U,
+                                                                      45U,
+                                                                      g_ch378_demo_read_state.read_buffer_45,
+                                                                      sizeof(g_ch378_demo_read_state.read_buffer_45),
+                                                                      &g_ch378_demo_read_state.read_length_45);
+    }
+
+    g_ch378_demo_result_state.write_result_46 = ch378_storage_write(2026U,
+                                                                    5U,
+                                                                    6U,
+                                                                    16U,
+                                                                    46U,
+                                                                    "temperature=21.35;humidity=46.80;pressure=101.25");
+    if(g_ch378_demo_result_state.write_result_46 == CH378_STORAGE_SUCCESS)
+    {
+        g_ch378_demo_result_state.read_result_46 = ch378_storage_read(2026U,
+                                                                      5U,
+                                                                      6U,
+                                                                      16U,
+                                                                      46U,
+                                                                      g_ch378_demo_read_state.read_buffer_46,
+                                                                      sizeof(g_ch378_demo_read_state.read_buffer_46),
+                                                                      &g_ch378_demo_read_state.read_length_46);
+    }
+
+    while(1)
+    {
+        R_BSP_SoftwareDelay(1000U, BSP_DELAY_UNITS_MILLISECONDS);
+    }
+#if BSP_TZ_SECURE_BUILD
+    R_BSP_NonSecureEnter(); // Enter non-secure code
+#endif
+}
+
+/*
+ * 说明：在系统启动的不同阶段完成数据闪存和引脚初始化。
+ * 输入：event：当前系统启动阶段。
+ * 输出：无。
+ */
+void R_BSP_WarmStart(bsp_warm_start_event_t event)
+{
+    if (BSP_WARM_START_RESET == event)
+    {
+#if BSP_FEATURE_FLASH_LP_VERSION != 0
+
+        R_FACI_LP->DFLCTL = 1U; // Enable reading from data flash
+        // C 运行环境初始化时间通常超过 6 us，因此这里不再单独等待数据闪存恢复
+#endif
+    }
+
+    if (BSP_WARM_START_POST_C == event)
+    {
+        R_IOPORT_Open (&g_ioport_ctrl, g_ioport.p_cfg); // C 运行环境和系统时钟就绪后配置引脚
+    }
+}
+
+#if BSP_TZ_SECURE_BUILD
+
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ();
+
+/*
+ * 说明：为 TrustZone 安全工程提供非安全可调用入口占位函数。
+ * 输入：无。
+ * 输出：无。
+ */
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ()
+{
+
+}
+#endif

@@ -1,0 +1,435 @@
+#include "ch378_storage.h"
+
+#include "ch378_file_device.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#define STORAGE_DIRECTORY_LENGTH    32U
+#define STORAGE_FILENAME_LENGTH     16U
+#define STORAGE_PATH_LENGTH         48U
+#define STORAGE_RECORD_LENGTH       256U
+
+static uint8_t g_selected_storage = CH378_STORAGE_USB;
+static uint8_t g_storage_mounted;
+
+/* ------------------------------ 参数校验 ------------------------------ */
+
+/*
+ * 说明：校验输入日期是否有效，并处理闰年二月。
+ * 输入：year：年；month：月；day：日。
+ * 输出：日期有效返回 1，无效返回 0。
+ */
+static uint8_t storage_date_is_valid(uint16_t year, uint8_t month, uint8_t day)
+{
+    static const uint8_t days_in_month[12] =
+    {
+        31U, 28U, 31U, 30U, 31U, 30U,
+        31U, 31U, 30U, 31U, 30U, 31U
+    };
+    uint8_t maximum_day;
+    uint8_t leap_year;
+
+    if((year < 1980U) || (year > 9999U) ||
+       (month < 1U) || (month > 12U) || (day < 1U))
+    {
+        return 0U;
+    }
+
+    maximum_day = days_in_month[month - 1U];
+    leap_year = (uint8_t) ((((year % 4U) == 0U) && ((year % 100U) != 0U)) ||
+                           ((year % 400U) == 0U));
+    if((month == 2U) && (leap_year != 0U))
+    {
+        maximum_day = 29U;
+    }
+
+    return (uint8_t) (day <= maximum_day);
+}
+
+/* ------------------------------ 介质管理 ------------------------------ */
+
+/*
+ * 说明：检测并挂载当前选择的存储介质。
+ * 输入：无。
+ * 输出：函数执行结果或读取到的数据。
+ */
+static uint8_t storage_mount(void)
+{
+    uint8_t result;
+    uint8_t disk_status;
+    uint8_t retry;
+
+    result = CH378DiskConnect();
+    if(result != ERR_SUCCESS)
+    {
+        g_storage_mounted = 0U;
+        return result;
+    }
+
+    disk_status = CH378GetDiskStatus();
+    if(g_storage_mounted != 0U)
+    {
+        if((disk_status >= DEF_DISK_READY) ||
+           ((g_selected_storage == CH378_STORAGE_SD) &&
+            (disk_status >= DEF_DISK_MOUNTED)))
+        {
+            return ERR_SUCCESS;
+        }
+        g_storage_mounted = 0U;
+    }
+
+    if(g_selected_storage == CH378_STORAGE_USB)
+    {
+        result = CH378DiskReady();
+        if(result == ERR_SUCCESS)
+        {
+            g_storage_mounted = 1U;
+        }
+        return result;
+    }
+
+    R_BSP_SoftwareDelay(200U, BSP_DELAY_UNITS_MILLISECONDS);
+    for(retry = 0U; retry < 100U; retry++)
+    {
+        R_BSP_SoftwareDelay(50U, BSP_DELAY_UNITS_MILLISECONDS);
+        result = CH378DiskReady();
+        disk_status = CH378GetDiskStatus();
+
+        if(result == ERR_SUCCESS)
+        {
+            g_storage_mounted = 1U;
+            return ERR_SUCCESS;
+        }
+        if(result == ERR_DISK_DISCON)
+        {
+            return result;
+        }
+        if((disk_status >= DEF_DISK_MOUNTED) && (retry >= 5U))
+        {
+            g_storage_mounted = 1U;
+            return ERR_SUCCESS;
+        }
+    }
+
+    return result;
+}
+
+/* ------------------------------ 文件写入 ------------------------------ */
+
+/*
+ * 说明：逐级创建目录，并在目标目录中创建文件。
+ * 输入：directory_path：目录路径；filename：文件名。
+ * 输出：函数执行结果或读取到的数据。
+ */
+static uint8_t storage_create_file(const uint8_t *directory_path,
+                                   const uint8_t *filename)
+{
+    uint8_t current_directory[STORAGE_PATH_LENGTH] = {0};
+    uint8_t result;
+    size_t index;
+    size_t directory_length;
+
+    directory_length = strlen((const char *) directory_path);
+    if((directory_length == 0U) ||
+       (directory_length >= sizeof(current_directory)))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    for(index = 0U; index < directory_length; index++)
+    {
+        current_directory[index] = directory_path[index];
+
+        if((directory_path[index + 1U] == (uint8_t) '/') ||
+           (directory_path[index + 1U] == (uint8_t) '\0'))
+        {
+            result = CH378FileDirCreate(current_directory);
+            if(result != ERR_SUCCESS)
+            {
+                return result;
+            }
+        }
+    }
+
+    return CH378FileCreate((uint8_t *) filename);
+}
+
+/*
+ * 说明：打开或创建目标文件，将记录追加到文件末尾并保存 FAT 信息。
+ * 输入：directory_path：目录路径；filename：文件名；file_path：完整路径；record：记录数据；record_length：记录长度。
+ * 输出：函数执行结果或读取到的数据。
+ */
+static uint8_t storage_append_record(uint8_t *directory_path,
+                                     uint8_t *filename,
+                                     uint8_t *file_path,
+                                     uint8_t *record,
+                                     uint16_t record_length)
+{
+    uint8_t result;
+    uint8_t close_result;
+    uint16_t real_count = 0U;
+    uint32_t file_length;
+
+    result = CH378FileOpen(file_path);
+    if(result == ERR_SUCCESS)
+    {
+        file_length = CH378GetFileSize();
+        result = CH378ByteLocate(file_length);
+        if(result != ERR_SUCCESS)
+        {
+            (void) CH378FileClose(0U);
+            return result;
+        }
+    }
+    else
+    {
+        result = storage_create_file(directory_path, filename);
+        if(result != ERR_SUCCESS)
+        {
+            return result;
+        }
+
+        result = CH378FileOpen(file_path);
+        if(result != ERR_SUCCESS)
+        {
+            return result;
+        }
+    }
+
+    result = CH378ByteWrite(record, record_length, &real_count);
+    close_result = CH378FileClose(1U);
+
+    if(result != ERR_SUCCESS)
+    {
+        return result;
+    }
+    if(close_result != ERR_SUCCESS)
+    {
+        return close_result;
+    }
+    if(real_count != record_length)
+    {
+        return USB_INT_DISK_ERR;
+    }
+
+    return ERR_SUCCESS;
+}
+
+/* ------------------------------ 公共接口 ------------------------------ */
+
+/*
+ * 说明：选择存储介质并初始化 CH378，0 为 U盘，1 为 SD 卡。
+ * 输入：device：0 选择 U盘，1 选择 SD 卡。
+ * 输出：成功返回 CH378_STORAGE_SUCCESS，失败返回错误码。
+ */
+uint8_t ch378_storage_config(uint8_t device)
+{
+    uint8_t host_mode;
+
+    if((device != CH378_STORAGE_USB) && (device != CH378_STORAGE_SD))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    g_selected_storage = device;
+    g_storage_mounted = 0U;
+    host_mode = (device == CH378_STORAGE_SD) ?
+                CH378_HOST_MODE_SD_CARD :
+                CH378_HOST_MODE_USB_DISK;
+
+    return Init_CH378Host(host_mode);
+}
+
+/*
+ * 说明：根据年月日时分生成路径，并向文件追加一条数据记录。
+ * 输入：year：年；month：月；day：日；hour：时；minute：分；data：待写入字符串。
+ * 输出：成功返回 CH378_STORAGE_SUCCESS，失败返回错误码。
+ */
+uint8_t ch378_storage_write(uint16_t year,
+                            uint8_t month,
+                            uint8_t day,
+                            uint8_t hour,
+                            uint8_t minute,
+                            const char *data)
+{
+    uint8_t directory_path[STORAGE_DIRECTORY_LENGTH] = {0};
+    uint8_t filename[STORAGE_FILENAME_LENGTH] = {0};
+    uint8_t file_path[STORAGE_PATH_LENGTH] = {0};
+    uint8_t record[STORAGE_RECORD_LENGTH] = {0};
+    uint8_t result;
+    int result_length;
+
+    if((storage_date_is_valid(year, month, day) == 0U) ||
+       (hour > 23U) || (minute > 59U) ||
+       (data == NULL) || (data[0] == '\0'))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    result = storage_mount();
+    if(result != ERR_SUCCESS)
+    {
+        return result;
+    }
+
+    result_length = snprintf((char *) directory_path,
+                             sizeof(directory_path),
+                             "/%04u/%02u/%02u/%02u",
+                             (unsigned int) year,
+                             (unsigned int) month,
+                             (unsigned int) day,
+                             (unsigned int) hour);
+    if((result_length < 0) || ((size_t) result_length >= sizeof(directory_path)))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    result_length = snprintf((char *) filename,
+                             sizeof(filename),
+                             "%02u.TXT",
+                             (unsigned int) minute);
+    if((result_length < 0) || ((size_t) result_length >= sizeof(filename)))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    result_length = snprintf((char *) file_path,
+                             sizeof(file_path),
+                             "/%04u/%02u/%02u/%02u/%02u.TXT",
+                             (unsigned int) year,
+                             (unsigned int) month,
+                             (unsigned int) day,
+                             (unsigned int) hour,
+                             (unsigned int) minute);
+    if((result_length < 0) || ((size_t) result_length >= sizeof(file_path)))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    result_length = snprintf((char *) record,
+                             sizeof(record),
+                             "%04u-%02u-%02u %02u:%02u;%s\r\n",
+                             (unsigned int) year,
+                             (unsigned int) month,
+                             (unsigned int) day,
+                             (unsigned int) hour,
+                             (unsigned int) minute,
+                             data);
+    if((result_length <= 0) || ((size_t) result_length >= sizeof(record)))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    return storage_append_record(directory_path,
+                                 filename,
+                                 file_path,
+                                 record,
+                                 (uint16_t) result_length);
+}
+
+/*
+ * 说明：根据年月日时分定位文件，并从文件开头读取数据。
+ * 输入：year：年；month：月；day：日；hour：时；minute：分；buffer：接收缓冲区；buffer_size：缓冲区大小；read_length：实际读取长度。
+ * 输出：成功返回 CH378_STORAGE_SUCCESS，失败返回错误码。
+ */
+uint8_t ch378_storage_read(uint16_t year,
+                           uint8_t month,
+                           uint8_t day,
+                           uint8_t hour,
+                           uint8_t minute,
+                           uint8_t *buffer,
+                           uint16_t buffer_size,
+                           uint16_t *read_length)
+{
+    uint8_t file_path[STORAGE_PATH_LENGTH] = {0};
+    uint8_t result;
+    uint8_t close_result;
+    uint16_t request_count;
+    uint32_t real_count = 0U;
+    uint32_t file_length;
+    int path_length;
+
+    if((buffer == NULL) || (read_length == NULL) || (buffer_size < 2U))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    buffer[0] = (uint8_t) '\0';
+    *read_length = 0U;
+
+    if((storage_date_is_valid(year, month, day) == 0U) ||
+       (hour > 23U) || (minute > 59U))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    result = storage_mount();
+    if(result != ERR_SUCCESS)
+    {
+        return result;
+    }
+
+    path_length = snprintf((char *) file_path,
+                           sizeof(file_path),
+                           "/%04u/%02u/%02u/%02u/%02u.TXT",
+                           (unsigned int) year,
+                           (unsigned int) month,
+                           (unsigned int) day,
+                           (unsigned int) hour,
+                           (unsigned int) minute);
+    if((path_length < 0) || ((size_t) path_length >= sizeof(file_path)))
+    {
+        return ERR_PARAMETER_ERROR;
+    }
+
+    result = CH378FileOpen(file_path);
+    if(result != ERR_SUCCESS)
+    {
+        return result;
+    }
+
+    file_length = CH378GetFileSize();
+    if(file_length < (uint32_t) (buffer_size - 1U))
+    {
+        request_count = (uint16_t) file_length;
+    }
+    else
+    {
+        request_count = (uint16_t) (buffer_size - 1U);
+    }
+
+    if(request_count > 0U)
+    {
+        result = CH378ByteLocate(0U);
+        if(result == ERR_SUCCESS)
+        {
+            result = CH378ByteRead(buffer, request_count, &real_count);
+        }
+    }
+    else
+    {
+        result = ERR_SUCCESS;
+    }
+
+    close_result = CH378FileClose(0U);
+
+    if(result != ERR_SUCCESS)
+    {
+        return result;
+    }
+    if(real_count > (uint32_t) request_count)
+    {
+        return USB_INT_DISK_ERR;
+    }
+
+    buffer[real_count] = (uint8_t) '\0';
+    *read_length = (uint16_t) real_count;
+
+    if(close_result != ERR_SUCCESS)
+    {
+        return close_result;
+    }
+
+    return ERR_SUCCESS;
+}

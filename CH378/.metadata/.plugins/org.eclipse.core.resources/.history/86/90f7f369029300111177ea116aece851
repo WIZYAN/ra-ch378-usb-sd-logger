@@ -1,0 +1,315 @@
+#include "hal_data.h"
+#include "ch378_storage.h"
+#include "app_hmi.h"
+
+#include <stdio.h>
+
+#define APP_STORAGE_DEVICE    CH378_STORAGE_USB // 验证 SD 卡时改为 CH378_STORAGE_SD
+#define DEMO_READ_BUFFER_SIZE 1024U
+#define DEMO_QUERY_LOOP_DELAY_MS 10U
+#define DEMO_FILE_NOT_FOUND_RESULT 0x42U // CH378 文件未找到返回码
+#define DEMO_QUERY_RECORD_COUNT 10U      // 单次查询最多显示的有效记录数量
+#define DEMO_QUERY_MAX_MINUTES 1440U     // 单次查询最多向前回溯的分钟数量
+#define DEMO_TEST_RECORD_COUNT 50U       // 启动后写入的测试记录数量
+#define DEMO_TEST_DATA_LENGTH 64U        // 测试参数字符串缓冲区长度
+
+typedef struct
+{
+    uint8_t query_read_buffer[DEMO_READ_BUFFER_SIZE]; // 保存当前查询文件的读取数据
+    uint16_t query_read_length; // 保存当前查询文件的实际读取长度
+    HMI_Query_Time query_time; // 保存本次按钮查询使用的年月日时分
+    HMI_Query_Time search_time; // 保存跨文件回溯时当前检查的年月日时分
+    uint16_t checked_minutes; // 保存本次查询已经检查的分钟文件数量
+    uint8_t displayed_count; // 保存本次查询已经显示的有效记录数量
+    uint8_t added_count; // 保存当前分钟文件新显示的有效记录数量
+} CH378_Demo_Read_State; // 当前查询的数据、长度和时间状态
+
+typedef struct
+{
+    uint8_t write_results[DEMO_TEST_RECORD_COUNT]; // 保存 50 条测试记录各自的写入结果
+    uint8_t query_read_result; // 保存最近一次屏幕查询的文件读取结果
+    fsp_err_t hmi_init_result; // 保存串口屏初始化结果
+    fsp_err_t hmi_clear_result; // 保存最近一次查询的表格清除结果
+    fsp_err_t hmi_query_display_result; // 保存最近一次查询的表格显示结果
+    fsp_err_t hmi_status_result; // 保存最近一次查询状态文本的发送结果
+} CH378_Demo_Result_State; // 测试数据写入和屏幕查询结果状态
+
+CH378_Demo_Read_State g_ch378_demo_read_state; // 保存当前屏幕查询使用的数据
+
+CH378_Demo_Result_State g_ch378_demo_result_state =
+{
+    .write_results = {0xFFU}, // 测试记录写入接口尚未执行
+    .query_read_result = 0xFFU, // 屏幕查询读取接口尚未执行
+    .hmi_init_result = FSP_ERR_NOT_OPEN, // 串口屏初始化接口尚未执行
+    .hmi_clear_result = FSP_ERR_NOT_OPEN, // 表格清除接口尚未执行
+    .hmi_query_display_result = FSP_ERR_NOT_OPEN, // 查询结果显示接口尚未执行
+    .hmi_status_result = FSP_ERR_NOT_OPEN // 查询状态文本发送接口尚未执行
+}; // 保存测试数据写入和屏幕查询的接口返回结果
+
+FSP_CPP_HEADER
+void R_BSP_WarmStart(bsp_warm_start_event_t event);
+FSP_CPP_FOOTER
+
+/*
+ * 说明：计算指定年月对应月份的天数，并处理闰年二月。
+ * 输入：year：年；month：月。
+ * 输出：返回指定月份的天数。
+ */
+static uint8_t demo_days_in_month(uint16_t year, uint8_t month)
+{
+    uint8_t days;
+
+    if((month == 4U) || (month == 6U) || (month == 9U) || (month == 11U))
+    {
+        days = 30U;
+    }
+    else if(month == 2U)
+    {
+        days = 28U;
+        if((((year % 4U) == 0U) && ((year % 100U) != 0U)) || ((year % 400U) == 0U))
+        {
+            days = 29U;
+        }
+    }
+    else
+    {
+        days = 31U;
+    }
+
+    return days;
+}
+
+/*
+ * 说明：把查询时间向前移动一分钟，并正确处理小时、日期、月份和年份边界。
+ * 输入：time：需要向前移动的查询时间地址。
+ * 输出：成功返回 1，到达支持年份下限或参数无效返回 0。
+ */
+static uint8_t demo_time_decrement_minute(HMI_Query_Time *time)
+{
+    if((time == NULL) || (time->year <= 1980U))
+    {
+        return 0U;
+    }
+    if(time->minute > 0U)
+    {
+        time->minute--;
+        return 1U;
+    }
+
+    time->minute = 59U;
+    if(time->hour > 0U)
+    {
+        time->hour--;
+        return 1U;
+    }
+
+    time->hour = 23U;
+    if(time->day > 1U)
+    {
+        time->day--;
+        return 1U;
+    }
+
+    if(time->month > 1U)
+    {
+        time->month--;
+    }
+    else
+    {
+        time->year--;
+        time->month = 12U;
+    }
+    time->day = demo_days_in_month(time->year, time->month);
+    return 1U;
+}
+
+/*
+ * 说明：初始化串口屏和存储介质，写入五十条测试数据，并在主循环处理最近十条记录查询。
+ * 输入：无。
+ * 输出：无。
+ */
+void hal_entry(void)
+{
+    char test_data[DEMO_TEST_DATA_LENGTH] = {0};
+    uint8_t test_index;
+    uint8_t test_minute;
+    uint8_t test_second;
+    uint8_t maximum_second;
+    uint8_t remaining_count;
+    int test_data_length;
+
+    g_ch378_demo_result_state.hmi_init_result = app_hmi_init();
+
+    if(ch378_storage_config(APP_STORAGE_DEVICE) != CH378_STORAGE_SUCCESS) // 0 选择 U盘，1 选择 SD 卡
+    {
+        while(1) // 存储介质选择无效或 CH378 初始化失败
+        {
+        }
+    }
+
+    for(test_index = 0U; test_index < DEMO_TEST_RECORD_COUNT; test_index++)
+    {
+        if(test_index < 40U)
+        {
+            test_minute = 45U;
+            test_second = (uint8_t) (test_index + 11U);
+        }
+        else
+        {
+            test_minute = 46U;
+            test_second = (uint8_t) (test_index - 40U);
+        }
+
+        test_data_length = snprintf(test_data,
+                                    sizeof(test_data),
+                                    "temperature=21.%02u;humidity=46.%02u;pressure=101.%02u",
+                                    (unsigned int) test_index,
+                                    (unsigned int) test_index,
+                                    (unsigned int) test_index);
+        if((test_data_length < 0) || ((size_t) test_data_length >= sizeof(test_data)))
+        {
+            g_ch378_demo_result_state.write_results[test_index] = 0x03U;
+            continue;
+        }
+
+        g_ch378_demo_result_state.write_results[test_index] = ch378_storage_write(2026U,
+                                                                                   5U,
+                                                                                   6U,
+                                                                                   16U,
+                                                                                   test_minute,
+                                                                                   test_second,
+                                                                                   test_data);
+    }
+
+    while(1)
+    {
+        app_hmi_process_input(); // 解析 ID2 至 ID6 文本控件上传的最新查询条件
+
+        if((g_ch378_demo_result_state.hmi_init_result == FSP_SUCCESS) &&
+           (app_hmi_take_query_request(&g_ch378_demo_read_state.query_time) != 0U))
+        {
+            g_ch378_demo_result_state.hmi_status_result =
+                    app_hmi_show_query_status(HMI_QUERY_STATUS_QUERYING);
+            g_ch378_demo_result_state.hmi_clear_result = app_hmi_clear_storage_records();
+            g_ch378_demo_result_state.hmi_query_display_result = FSP_ERR_NOT_OPEN;
+            g_ch378_demo_read_state.search_time = g_ch378_demo_read_state.query_time;
+            g_ch378_demo_read_state.displayed_count = 0U;
+
+            for(g_ch378_demo_read_state.checked_minutes = 0U;
+                (g_ch378_demo_read_state.checked_minutes < DEMO_QUERY_MAX_MINUTES) &&
+                (g_ch378_demo_read_state.displayed_count < DEMO_QUERY_RECORD_COUNT);
+                g_ch378_demo_read_state.checked_minutes++)
+            {
+                g_ch378_demo_result_state.query_read_result = ch378_storage_read(
+                        g_ch378_demo_read_state.search_time.year,
+                        g_ch378_demo_read_state.search_time.month,
+                        g_ch378_demo_read_state.search_time.day,
+                        g_ch378_demo_read_state.search_time.hour,
+                        g_ch378_demo_read_state.search_time.minute,
+                        g_ch378_demo_read_state.query_read_buffer,
+                        sizeof(g_ch378_demo_read_state.query_read_buffer),
+                        &g_ch378_demo_read_state.query_read_length);
+
+                if(g_ch378_demo_result_state.query_read_result == CH378_STORAGE_SUCCESS)
+                {
+                    maximum_second = (g_ch378_demo_read_state.checked_minutes == 0U) ? 0U : 59U;
+                    remaining_count = (uint8_t) (DEMO_QUERY_RECORD_COUNT -
+                                                 g_ch378_demo_read_state.displayed_count);
+                    g_ch378_demo_result_state.hmi_query_display_result =
+                            app_hmi_display_storage_records(
+                                    g_ch378_demo_read_state.query_read_buffer,
+                                    maximum_second,
+                                    remaining_count,
+                                    &g_ch378_demo_read_state.added_count);
+                    if(g_ch378_demo_result_state.hmi_query_display_result != FSP_SUCCESS)
+                    {
+                        break;
+                    }
+                    g_ch378_demo_read_state.displayed_count =
+                            (uint8_t) (g_ch378_demo_read_state.displayed_count +
+                                      g_ch378_demo_read_state.added_count);
+                }
+                else if(g_ch378_demo_result_state.query_read_result != DEMO_FILE_NOT_FOUND_RESULT)
+                {
+                    break;
+                }
+
+                if((g_ch378_demo_read_state.displayed_count < DEMO_QUERY_RECORD_COUNT) &&
+                   (demo_time_decrement_minute(&g_ch378_demo_read_state.search_time) == 0U))
+                {
+                    break;
+                }
+            }
+
+            if(g_ch378_demo_result_state.hmi_clear_result != FSP_SUCCESS)
+            {
+                g_ch378_demo_result_state.hmi_status_result =
+                        app_hmi_show_query_status(HMI_QUERY_STATUS_DISPLAY_ERROR);
+            }
+            else if((g_ch378_demo_result_state.hmi_query_display_result != FSP_SUCCESS) &&
+                    (g_ch378_demo_result_state.hmi_query_display_result != FSP_ERR_NOT_OPEN))
+            {
+                g_ch378_demo_result_state.hmi_status_result =
+                        app_hmi_show_query_status(HMI_QUERY_STATUS_DISPLAY_ERROR);
+            }
+            else if((g_ch378_demo_result_state.query_read_result != CH378_STORAGE_SUCCESS) &&
+                    (g_ch378_demo_result_state.query_read_result != DEMO_FILE_NOT_FOUND_RESULT))
+            {
+                g_ch378_demo_result_state.hmi_status_result =
+                        app_hmi_show_query_status(HMI_QUERY_STATUS_READ_ERROR);
+            }
+            else if(g_ch378_demo_read_state.displayed_count == 0U)
+            {
+                g_ch378_demo_result_state.hmi_status_result =
+                        app_hmi_show_query_status(HMI_QUERY_STATUS_NO_DATA);
+            }
+            else
+            {
+                g_ch378_demo_result_state.hmi_status_result =
+                        app_hmi_show_query_status(HMI_QUERY_STATUS_SUCCESS);
+            }
+        }
+
+        R_BSP_SoftwareDelay(DEMO_QUERY_LOOP_DELAY_MS, BSP_DELAY_UNITS_MILLISECONDS); // 限制主循环查询输入处理频率
+    }
+#if BSP_TZ_SECURE_BUILD
+    R_BSP_NonSecureEnter(); // Enter non-secure code
+#endif
+}
+
+/*
+ * 说明：在系统启动的不同阶段完成数据闪存和引脚初始化。
+ * 输入：event：当前系统启动阶段。
+ * 输出：无。
+ */
+void R_BSP_WarmStart(bsp_warm_start_event_t event)
+{
+    if (BSP_WARM_START_RESET == event)
+    {
+#if BSP_FEATURE_FLASH_LP_VERSION != 0
+
+        R_FACI_LP->DFLCTL = 1U; // Enable reading from data flash
+        // C 运行环境初始化时间通常超过 6 us，因此这里不再单独等待数据闪存恢复
+#endif
+    }
+
+    if (BSP_WARM_START_POST_C == event)
+    {
+        R_IOPORT_Open (&g_ioport_ctrl, g_ioport.p_cfg); // C 运行环境和系统时钟就绪后配置引脚
+    }
+}
+
+#if BSP_TZ_SECURE_BUILD
+
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ();
+
+/*
+ * 说明：为 TrustZone 安全工程提供非安全可调用入口占位函数。
+ * 输入：无。
+ * 输出：无。
+ */
+BSP_CMSE_NONSECURE_ENTRY void template_nonsecure_callable ()
+{
+
+}
+#endif

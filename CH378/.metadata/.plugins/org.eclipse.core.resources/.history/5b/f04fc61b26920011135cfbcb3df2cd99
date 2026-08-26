@@ -1,0 +1,21 @@
+/*
+ * H_HMI.h
+ *
+ *  Created on: 2024年3月6日
+ *      Author: Administrator
+ */
+
+#ifndef H_HMI_H_
+#define H_HMI_H_
+
+#include "menu_data_update.h"
+
+
+void hmi_timer_init(void);
+void hmi_uart_init(void);
+void hmi_enable_power(void);
+void hmi_disenable_power(void);
+void hmi_enable_uart(void);
+void hmi_send_one_char(uint8_t data);
+
+#endif /* H_HMI_H_ */

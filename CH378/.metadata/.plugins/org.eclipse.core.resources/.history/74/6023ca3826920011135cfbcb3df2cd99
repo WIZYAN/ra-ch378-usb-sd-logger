@@ -1,0 +1,146 @@
+/*
+ * F_HMI.c
+ *
+ *  Created on: 2024年1月25日
+ *      Author: CI
+ */
+#include <app_hmi.h>
+#include "F_HMI.h"
+#include "sensor_o2.h"
+HMI g_hmi;
+/***************************************** 函数功能 *********************************************/
+/*
+ * 说明：屏相关保存值初始化
+ * 输入：无
+ * 输出：无
+ */
+void g_hmi_save_para_init(void)
+{
+    uint8_t model_temp[] = "00000000000000";
+    uint8_t series_temp[] = "00000000000000";
+    uint8_t sensor_temp[] = "00000000000000";
+    uint8_t order_temp[] = "00000000000000";
+
+    g_hmi.save.language = 0;
+    g_hmi.save.light_low = 12;
+    g_hmi.save.light_upp = 100;
+    g_hmi.save.light_time = 300;
+
+    for(int num = 0; num < 14; num++)
+    {
+        g_hmi.save.num_model[num] = model_temp[num];//仪器型号
+        g_hmi.save.num_series[num] = series_temp[num];//整机编号
+        g_hmi.save.num_sensor[num] = sensor_temp[num];//传感器型号
+        g_hmi.save.num_order[num] = order_temp[num];//订单编号
+    }
+    g_hmi.save.num_model[14] = '\0';//用于结束数组
+    g_hmi.save.num_series[14] = '\0';
+    g_hmi.save.num_sensor[14] = '\0';
+    g_hmi.save.num_order[14] = '\0';
+}
+
+/*
+ * 功能：屏幕初始化函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+void App_HMI_Init(uint8_t init_sw)
+{
+    if(init_sw)
+    {
+        funcation_hmi_init();
+    }
+    if(g_hmi.save.language == 0)
+        SetLanguageToChinese();
+    else
+        SetLanguageToEnglish();
+
+    SetAutoLight(1, g_hmi.save.light_upp, g_hmi.save.light_low, g_hmi.save.light_time);
+}
+
+/*
+ * 功能：屏幕事件数据处理函数
+ * 输入：无
+ * 输出：无
+ */
+uint8_t App_HMI_ReceiveData_Handle(void)
+{
+    uint8_t control_operation = 0;
+    static qsize size = 0;
+
+    size = queue_find_cmd(cmd_buffer,CMD_MAX_SIZE);
+    if(size > 0 && cmd_buffer[1] != 0x07)   //接收到指令，不是复位指令
+    {
+        control_operation = ProcessMessage((PCTRL_MSG)cmd_buffer);//指令处理
+    }
+
+    return control_operation;
+}
+
+
+void App_Sig_Dis(VAL_UNIT *val_unit)
+{
+    if(val_unit->sig >= 1)//uA
+    {
+        val_unit->judge_unit = 1;
+
+        if(val_unit->sig >= 1000)
+        {
+            val_unit->judge_dot = 0;
+        }
+        else if(val_unit->sig >= 100)
+        {
+            val_unit->judge_dot = 1;
+        }
+        else if(val_unit->sig >= 10)
+        {
+            val_unit->judge_dot = 2;
+        }
+        else
+        {
+            val_unit->judge_dot = 3;
+        }
+    }
+    else
+    {
+        val_unit->judge_unit = 0;
+        if(val_unit->sig*1000 >= 100)
+        {
+            val_unit->judge_dot = 1;
+        }
+        else if(val_unit->sig*1000 >= 10)
+        {
+            val_unit->judge_dot = 2;
+        }
+        else
+        {
+            val_unit->judge_dot = 3;
+        }
+    }
+
+    if(val_unit->judge_unit)//ua
+    {
+        //1.单位切换
+        SetSelectorValue(val_unit->screen_id, val_unit->ctrl_id_unit, 1);
+        //2.数值切换
+        val_unit->sig_dis = val_unit->sig;
+        //3.显示
+    }
+    else//na
+    {
+        //1.单位切换
+        SetSelectorValue(val_unit->screen_id, val_unit->ctrl_id_unit, 0);
+        //2.数值切换
+        val_unit->sig_dis = val_unit->sig*1000;
+    }
+
+    //3.显示
+    BatchBegin(val_unit->screen_id);
+    if(val_unit->judge_dot == 0)
+        BatchSetTextInt32(val_unit->ctrl_id_val, (int32_t)val_unit->sig_dis);
+    else
+        BatchSetTextDouble(val_unit->ctrl_id_val, val_unit->sig_dis, val_unit->judge_dot);
+    BatchEnd();
+}
+

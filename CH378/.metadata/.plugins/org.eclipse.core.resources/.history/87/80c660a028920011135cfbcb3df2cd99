@@ -1,0 +1,144 @@
+/*
+ * menu_stack.c
+ *
+ *  Created on: 2024年3月7日
+ *      Author: Administrator
+ */
+
+#include "menu_stack.h"
+#include "app_flash.h"
+
+int16_t  g_stack[MAX_STACK] = {0,0,0,0};        //栈数组
+int8_t   g_position_now = - 2;                    //当前栈位置
+
+/*
+ * 说明：入栈操作
+ * 输入：stand_value：栈值
+ * 输出：无
+ * 返回：0入栈成功  ，1入栈失败
+ */
+static uint8_t App_In_Stand(int16_t val_stack)
+{
+    if(g_position_now < MAX_STACK)
+    {
+        g_stack[g_position_now] = val_stack;
+        g_position_now++;
+
+        return 0;
+    }
+    else
+        return 1;
+}
+
+/*
+ * 说明：出栈操作，当前栈位置大于0时才能操作
+ * 输入：无
+ * 输出：无
+ * 返回：0出栈成功  ，1出栈失败
+ */
+static uint8_t App_Out_Stand(void)
+{
+    int16_t temp_position;
+
+    if(g_position_now <= 0)//清空栈
+    {
+        g_stack[0] = 0;
+        g_position_now = 0;
+        return 1;
+    }
+    else//出栈
+    {
+        temp_position = g_position_now - 1;
+        if(temp_position < 0)
+            temp_position = 0;
+        g_stack[temp_position] = 0;
+        g_position_now--;
+        if(g_position_now < 0)
+            g_position_now = 0;
+        return 0;
+    }
+}
+
+/*
+ * 说明：清空栈，清空栈位置和栈值，用于返回主界面
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+static void empty_stack(void)
+{
+    uint8_t i;
+
+    for(i = 0; i < MAX_STACK; i++)
+    {
+        g_stack[i] = 0;
+    }
+    g_position_now = 0;
+}
+
+/*
+ * 说明：多次出栈，用于返回多个页面
+ * 输入：number：出栈的次数
+ * 输出：无
+ * 返回：无
+ */
+static void multiple_stack(uint8_t number)
+{
+    for(uint8_t i = 0; i < number;i++)
+        App_Out_Stand();
+}
+
+
+
+/******************************菜单业务调用函数*******************************************/
+/*
+ * 功能：进栈切换界面，界面ID赋值
+ * 输入：界面ID
+ * 输出：无
+ */
+void App_Return_Main_Dis()
+{
+    empty_stack();
+    g_flash_var.com_save_flag = 1;//保存掉电数据
+    g_flash_var.save_flag.Bits.write_time = 1;//保存掉电数据
+}
+
+/*
+ * 功能：进栈切换界面，界面ID赋值
+ * 输入：界面ID
+ * 输出：无
+ */
+void App_Menu_Page_Sw(int16_t page_id)
+{
+    App_In_Stand(page_id);
+}
+
+/*
+ * 功能：出栈一次，用于返回到上次的页面
+ * 输入：无
+ * 输出：无
+ */
+void App_Menu_Page_Back(void)
+{
+    multiple_stack(1);
+}
+
+/*
+ * 功能：退栈两次，用于返回到上上次的界面
+ * 输入：无
+ * 输出：无
+ */
+void App_Menu_Page_Back_Twice(void)
+{
+    multiple_stack(2);
+}
+
+/*
+ * 功能：退栈三次，用于返回到上上上次的界面
+ * 输入：无
+ * 输出：无
+ */
+void App_Menu_Page_Back_Three(void)
+{
+    multiple_stack(3);
+}

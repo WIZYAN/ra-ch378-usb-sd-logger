@@ -1,0 +1,17 @@
+13:12:11 **** Incremental Build of configuration Debug for project CH378 ****
+make -j12 all 
+Building file: ../src/hal_entry.c
+Building file: ../HMI/F_HMI.c
+Building file: ../HMI/H_hmi.c
+Building file: ../HMI/app_hmi.c
+Building file: ../CH378_USB/ch378_file_device.c
+Building file: ../CH378_USB/ch378_hard.c
+Building file: ../CH378_USB/ch378_storage.c
+Building target: CH378.elf
+arm-none-eabi-objcopy -O srec "CH378.elf"  "CH378.srec"
+arm-none-eabi-size --format=berkeley "CH378.elf"
+   text	   data	    bss	    dec	    hex	filename
+  22616	    812	   3364	  26792	   68a8	CH378.elf
+
+13:12:12 Build Finished. 0 errors, 0 warnings. (took 1s.106ms)
+

@@ -1,0 +1,12 @@
+18:40:45 **** Incremental Build of configuration Debug for project usb ****
+make -j12 all 
+Building file: ../src/hal_entry.c
+Building file: ../CH378_USB/ch378_storage.c
+Building target: usb.elf
+arm-none-eabi-objcopy -O srec "usb.elf"  "usb.srec"
+arm-none-eabi-size --format=berkeley "usb.elf"
+   text	   data	    bss	    dec	    hex	filename
+  14864	    112	  10544	  25520	   63b0	usb.elf
+
+18:40:47 Build Finished. 0 errors, 0 warnings. (took 1s.423ms)
+

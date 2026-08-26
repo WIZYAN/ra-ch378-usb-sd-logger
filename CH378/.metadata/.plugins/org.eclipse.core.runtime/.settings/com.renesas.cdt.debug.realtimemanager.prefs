@@ -1,0 +1,2 @@
+eclipse.preferences.version=1
+prefRealtimeExpressions=<?xml version\="1.0" encoding\="UTF-8" standalone\="no"?>\r\n<realtimeExpressions>\r\n    <expression text\="g_ch378_demo_read_state.displayed_count"/>\r\n    <expression text\="g_ch378_demo_read_state.added_count"/>\r\n    <expression text\="g_ch378_demo_read_state.checked_minutes"/>\r\n    <expression text\="g_ch378_demo_result_state.hmi_query_display_result"/>\r\n</realtimeExpressions>\r\n

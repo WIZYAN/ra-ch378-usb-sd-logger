@@ -1,0 +1,6143 @@
+/*
+ * A_Menu.c
+ *
+ *  Created on: 2024年1月19日
+ *      Author: CI
+ */
+
+#include <app_menu.h>
+#include <stdio.h>
+#include "menu_stack.h"
+#include "app_hmi.h"
+#include "F_HMI.h"
+
+/************************************** 变量声明 *****************************************/
+//菜单运行全局结构体
+menu_class g_menu;
+
+//触摸屏消息指令转接全局
+PAGE_CONTROL g_page;
+static int16_t page_id_last = 0; //上次所在界面
+uint32_t menu_transmission_value; //用于菜单界面临时传值
+
+enum
+{
+    menu_flow_cal,
+    menu_formating,
+    menu_ref_set,
+    menu_internet_set,
+    menu_cal_micro,
+    menu_flow_close,
+    menu_flow_open,
+    menu_flow_cur_cail,
+    menu_flow_set,
+    menu_flow_ctrl,
+    menu_usb_export,
+    menu_work_doubleo2,
+    menu_format_conc_record,
+    menu_format_pre_record,
+    menu_format_temp_record,
+    menu_format_all_record,
+    menu_valve_cal,//针形阀零点校准
+    NONE = 1000,
+} menu_waiting; //用于等待页面  判断是哪个页面触发的
+enum
+{
+    cal_0918_zero = 1,
+    cal_0918_span,
+    cal_0330_zero_shg,
+    cal_0330_span1_shg,
+    cal_0330_span2_shg,
+    cal_0330_span3_shg,
+    cal_0330_zero_dir,
+    cal_0330_span1_dir,
+    cal_0330_span2_dir,
+    cal_0330_span3_dir,
+
+    h2_cal_0330_zero = 1,
+    h2_cal_0330_span1,
+    h2_cal_0330_span2,
+    h2_cal_0330_span3,
+    h2_cal_0330_span4,
+    h2_cal_input,
+
+    high_o2_0330_cal_zero = 1,
+    high_o2_0330_cal_span1,
+    high_o2_0330_cal_span2,
+    high_o2_0330_cal_span3,
+
+    high_o2_0918_cal_zero = 6,
+    high_o2_0918_cal_span = 7,
+};
+//用于标定数据存储
+
+int8_t datasave_flag = 0; //是否更新历史数据标志  0更新显示   1部更新显示
+enum
+{
+    mode_dis_history, mode_dis_inquire
+} page_mode; //用于历史数据查找
+
+uint8_t name_temp[14] ={ 0 }, password_temp[14] ={ 0 }; //登录使用
+/************************************** 函数声明 *****************************************/
+
+/************************************** 函数定义 *****************************************/
+
+//程序版本号
+//主板程序版本号
+static uint8_t MAINVersion[27] = "M260705DMT-V1.18-0\0";
+
+//static uint8_t MAINVersion[27] = "19999999test";
+/*
+ * 说明：整机运行时间处理函数  放在1s定时器运行
+ * 输入：无
+ * 输出：无
+ */
+void run_runtime(void)
+{
+    static uint32_t temp_time = 0, trail_time = 0;
+
+    temp_time++;
+    if (temp_time >= 3600)
+    {
+        temp_time = 0;
+        g_menu.runtime++;
+        g_flash_var.save_flag.Bits.write_time = 1;
+    }
+    if (g_life.main.save.main_password_lock_switch)
+    {
+        trail_time++;
+        if (trail_time >= 3600)
+        {
+            trail_time = 0;
+            g_life.main.para.one_hour_flag = 1;
+        }
+    }
+}
+
+/*
+ * 说明：5分钟未操作界面，自动退出到主界面  放在1s定时器运行
+ * 输入：无
+ * 输出：无
+ */
+void run_back_main_dis(void)
+{
+    if ((g_stack[g_position_now - 1] == PAGE_Menu0918_DoubleO2))
+    {
+        g_menu.back_conter = 600;
+    }
+    else
+    {
+        if (g_menu.back_conter && g_position_now != 0 && g_stack[0] != 0) //计时不为0 ，栈位置和值不为0，表示进入菜单
+        {
+            g_menu.back_conter--;
+            if (g_menu.back_conter == 0)
+                App_Return_Main_Dis ();
+        }
+    }
+}
+
+/*
+ * 说明：菜单内使用的延时函数
+ * 输入：延时时间
+ * 输出：无
+ */
+static void menu_delay(uint16_t time)
+{
+    vTaskDelay(time);
+}
+
+static uint8_t ND_DIS_Change_Micro_ppm(uint16_t screen_id, uint16_t val_id, float val) //浓度显示转换，只用于显示浓度切换
+{
+    double val_temp_dis = val;
+
+    if (val_temp_dis < 10) //1-10ppm x.xxxppm
+    {
+        SetTextValueFloat (screen_id, val_id, (float) val_temp_dis, 2); //发送浓度
+        return 1;
+    }
+    else if (val_temp_dis < 100) //10-100ppm xx.xxppm
+    {
+        SetTextValueFloat (screen_id, val_id, (float) val_temp_dis, 1); //发送浓度
+        return 1;
+    }
+    else if (val_temp_dis < 1000) //100-1000ppm xxx.xppm
+    {
+        SetTextValueInt32 (screen_id, val_id, (int)val_temp_dis); //发送浓度
+        return 1;
+    }
+    else if (val_temp_dis < 10000) //1000-10000ppm xxxxppm
+    {
+        SetTextValueInt32 (screen_id, val_id, (int) val_temp_dis);
+        return 1;
+    }
+    else //1%以上
+    {
+        SetTextValueFloat (screen_id, val_id, (float) val_temp_dis / 10000, 2); //发送浓度
+        return 2;
+    }
+}
+/********************************************* 屏幕页面函数 ********************************************************/
+
+//欢迎界面
+/*
+ * 名称：欢迎界面首次运行函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+static void H_F_WelcomePage(void)
+{
+    g_page.screen_id = PAGE_WelcomePage;
+    SetScreen (g_page.screen_id);
+}
+
+/*
+ * 名称：欢迎界面周期性函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+static void H_P_WelcomePage(void)
+{
+    ;
+}
+
+/*
+ * 名称：操作运行函数
+ * 输入：转接指令结构体
+ * 输出：无
+ * 返回：无
+ */
+static void H_O_WelcomePage(PAGE_CONTROL *page_control)
+{
+    if(page_control->screen_id == 0 && page_control->ctrl_msg == 0x27)
+    {
+        g_page.cmd_type = 0;
+        g_position_now = -(MAX_NON_MENU_PAGE-1);
+    }
+    if(g_menu.save.heating_time == 0)//如果预热时间为0，直接跳到主界面
+    {
+        g_position_now = 0;//栈位置清0
+        g_stack[0] = 0;//栈值清0
+    }
+}
+
+
+/*
+ * 名称：加热界面首次运行函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+static void H_F_HeatPage(void)
+{
+    uint16_t screen_id_temp = PAGE_HeatPage;
+
+    g_menu.para.preheat_time_temp = g_menu.save.heating_time;
+    SetScreen (screen_id_temp);
+
+}
+
+/*
+ * 名称：加热界面周期性函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+static void H_P_HeatPage(void)
+{
+    uint32_t temp_preheat;
+    uint8_t percent;
+    uint16_t screen_id_temp = PAGE_HeatPage;
+
+    temp_preheat = g_menu.save.heating_time - g_menu.para.preheat_time_temp;
+    percent = (uint8_t) ((float) temp_preheat * 100.f / (float) g_menu.save.heating_time);
+    SetTextValueInt32 (screen_id_temp, 6, (int32_t) percent);//倒计时
+    //3.如果倒计时值为0时，则跳转到主界面
+    if (percent == 100)
+    {
+        g_position_now = 0;   //栈位置清0
+        g_stack[0] = 0;       //栈值清0
+    }
+}
+
+/*
+ * 名称：加热界面操作运行函数
+ * 输入：转接指令结构体
+ * 输出：无
+ * 返回：无
+ */
+static void H_O_HeatPage(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp;
+
+    screen_id_temp = PAGE_HeatPage;
+    if (page_control->control_id == 3 && page_control->control_type == kCtrlButton && page_control->screen_id == screen_id_temp)
+    {
+        g_position_now = 0;    //栈位置清0
+        g_stack[0] = 0;        //栈值清0
+    }
+}
+
+//主界面
+/*
+ * 名称：主界面周期性函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+static void H_P_MainPage(void)
+{
+    uint16_t screen_id_temp;
+    uint8_t temp_status;
+    static uint8_t time_ref_main = 0 , flow_state = 0;    //不重要的信息不用每次更新
+
+    screen_id_temp = PAGE_MainPage;
+    if (g_life.main.para.limit_state_lock)
+    {
+        App_Menu_Page_Sw (PAGE_Trial_Hint);
+    }
+    else
+    {
+        time_ref_main++;
+        if (time_ref_main % 3 == 0)    //约2s
+        {
+            BatchBegin (screen_id_temp);
+            BatchSetTextFloat (1, (float) g_ms5607_data_air.i_Temperature / 100, 1);
+            //吹扫/测试
+            BatchSetFrame (34 , g_sensor_o2.data_para.val_1_sta);
+            if (g_hmi.para.status_main_page)
+                temp_status = 1;
+            else
+                temp_status = 0;
+            BatchSetFrame (17, temp_status);    //状态报警
+            if (g_alarm[0].run_para.ala_sta)
+                temp_status = 1;
+            else
+                temp_status = 0;
+            BatchSetFrame (16, temp_status);    //浓度报警1
+            if (g_alarm[1].run_para.ala_sta)
+                temp_status = 1;
+            else
+                temp_status = 0;
+            BatchSetFrame (13, temp_status);    //浓度报警2
+            BatchEnd ();
+            //状态
+
+            SetSelectorValue (screen_id_temp, 33, g_sensor_o2.data_para.val_1_sta);
+            SetSelectorValue (screen_id_temp, 21, g_hmi.para.status_main_page);
+            SetSelectorValue (screen_id_temp, 4, g_alarm[0].run_para.ala_sta);
+            SetSelectorValue (screen_id_temp, 8, g_alarm[1].run_para.ala_sta);
+
+            //用户名显示
+            BatchBegin (screen_id_temp);
+            if (g_user_manage.save.rember_password_sw)
+            {
+                BatchSetText (26, name_temp);
+            }
+            else
+            {
+                BatchSetText (26, (uint8_t*) "   \0");
+            }
+            BatchEnd ();
+        }
+
+        if((g_var_temp.alarm_class + 0)->alarm_selection  == 4)//隐藏报警1
+        {
+            SetControlVisiable (screen_id_temp, 16, 0);           //隐藏
+            SetControlVisiable (screen_id_temp, 4000, 0);         //隐藏
+            SetControlVisiable (screen_id_temp, 4, 0);            //隐藏
+        }
+        else
+        {
+            SetControlVisiable (screen_id_temp, 16, 1);
+            SetControlVisiable (screen_id_temp, 4000, 1);
+            SetControlVisiable (screen_id_temp, 4, 1);
+        }
+        if((g_var_temp.alarm_class + 1)->alarm_selection  == 4)//隐藏报警2
+        {
+            SetControlVisiable (screen_id_temp, 13, 0);
+            SetControlVisiable (screen_id_temp, 4001, 0);
+            SetControlVisiable (screen_id_temp, 8, 0);            //隐藏
+        }
+        else
+        {
+            SetControlVisiable (screen_id_temp, 13, 1);
+            SetControlVisiable (screen_id_temp, 4001, 1);
+            SetControlVisiable (screen_id_temp, 8, 1);            //隐藏
+        }
+
+        SetTextValueFloat (screen_id_temp, 10, g_flow.para.flow_curr / 1000, 1);//流量显示
+
+        if (ND_DIS_Change_Micro_ppm (screen_id_temp, 3, (*g_var_temp.sensor.pointer_user_dis_tent)) == 2)     //浓度更新显示判断
+        {
+            AnimationPlayFrame (screen_id_temp, 2, 1);            //o2 %
+        }
+        else if (ND_DIS_Change_Micro_ppm (screen_id_temp, 3, (*g_var_temp.sensor.pointer_user_dis_tent)) == 1)
+        {
+            AnimationPlayFrame (screen_id_temp, 2, 0);            //o2 ppm
+        }
+    }
+
+    if(flow_state != g_flow.para.flow_control_err)
+    {
+        if(flow_state == 0)
+        {
+            App_Menu_Page_Sw(PAGE_control_flow_upper);
+        }
+        flow_state = g_flow.para.flow_control_err;
+    }
+}
+
+/*
+ * 名称：主界面首次运行函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+static void H_F_MainPage(void)
+{
+    H_P_MainPage ();
+    SetScreen (PAGE_MainPage);
+}
+
+/*
+ * 名称：主界面操作运行函数
+ * 输入：转接指令结构体
+ * 输出：无
+ * 返回：无
+ */
+static void H_O_MainPage(PAGE_CONTROL *page_control)
+{
+    if (page_control->control_type == kCtrlButton)
+    {
+        if (page_control->control_id == 24)
+        {
+           App_Menu_Page_Sw (PAGE_UserLogin);
+        }
+        else if (page_control->control_id == 15) //历史数据
+        {
+            App_Menu_Page_Sw (PAGE_TendencyChart);
+        }
+        else if (page_control->control_id == 23) //状态页面
+        {
+            App_Menu_Page_Sw (PAGE_dis_status);
+        }
+        else if (page_control->control_id == 6) //流量设置
+        {
+            App_Menu_Page_Sw (PAGE_FlowSet);
+        }
+        else if (page_control->control_id == 32) //吹扫测试
+        {
+            if( g_pump.save.exter_pump_control == 2)//外部控制
+            {
+                App_Menu_Page_Sw (PAGE_ex_control_tip);
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_OpenTest);
+            }
+        }
+        else if (page_control->control_id == 31) //仪器信息
+        {
+            if (g_life.sensor.save.Verification_switch) //证开关
+                App_Menu_Page_Sw (PAGE_Infor_certificate);
+            else
+                App_Menu_Page_Sw (PAGE_Infor);
+        }
+    }
+}
+
+/*
+ * 名称：状态详情
+ * 输入：无
+ * 返回：无
+ */
+static void H_P_dis_status(void)
+{
+    uint16_t screen_id_temp = PAGE_dis_status;
+    uint8_t temp_status;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextFloat (21, (float) g_ms5607_data_air.i_Temperature / 100, 1);
+    BatchSetTextFloat (20, (float) g_ms5607_data_air.i_Pressure / 1000, 1);
+    BatchSetTextInt32(29, (int32_t) g_sensor_o2.data_para.lock_count);
+    BatchEnd ();
+
+    //状态
+    BatchBegin (screen_id_temp);
+    if (g_hmi.para.status_main_page)    //整机状态报警
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (16, temp_status);    //状态报警
+    if (g_alarm[1].run_para.ala_sta)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (15, temp_status);    //浓度报警1
+    if (g_alarm[2].run_para.ala_sta)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (18, temp_status);    //浓度报警2
+    if (g_alarm[0].run_para.ala_sta)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (37, temp_status);    //浓度报警3
+
+    if (g_save_data_app.history_data.chip_ready)
+        temp_status = 0;
+    else
+        temp_status = 1;
+    BatchSetFrame (13, temp_status);    //存储
+
+    if (g_flow.para.flow_alarm_status)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (9, temp_status);    //流量报警
+
+    if (g_flow.para.pressure_alarm_status)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (7, temp_status);    //压力报警
+
+    if (g_flow.para.flow_control_err)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (1, temp_status);    //流量控制错误
+
+    if (*g_var_temp.sensor.pointer_comm_status)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (3, temp_status);    //传感器通讯
+
+    if (*g_var_temp.sensor.pointer_comm_status)    //微量氧需要加入传感器压力保护状态
+        temp_status = 1;
+    else
+        temp_status = 0;
+
+    BatchSetFrame (11, temp_status);    //传感器状态
+
+    if (g_life.main.para.limit_time_nearly_run_out_flag)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (6, temp_status);    //试用功能状态
+
+    if (g_hmi.para.conc_pro_state)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (59, temp_status);    //传感器浓度保护
+
+    if (g_alarm[3].run_para.ala_sta)
+        temp_status = 1;
+    else
+        temp_status = 0;
+    BatchSetFrame (55, temp_status);    //传感器压力保护
+    BatchEnd ();
+}
+
+/*
+ * 名称：主界面首次运行函数
+ * 输入：无
+ * 返回：无
+ */
+static void H_F_dis_status(void)
+{
+    H_P_dis_status ();    //刷新一次
+
+    SetScreen (PAGE_dis_status);
+}
+
+/*
+ * 名称：主界面操作运行函数
+ * 输入：转接指令结构体
+ * 返回：无
+ */
+static void H_O_dis_status(PAGE_CONTROL *page_control)
+{
+    //AA.按键事件
+    if (page_control->control_type == kCtrlButton)
+    {
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis();
+        }
+    }
+}
+
+
+//流量控制
+static void H_F_FlowSet(void)
+{
+    uint16_t screen_id_temp = PAGE_FlowSet;
+
+    g_flow.save.ctr_valve_opening = opening_fun();
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (3, (double) g_flow.para.flow_curr / 1000, 1);
+    BatchSetTextDouble (1, (double) g_flow.save.control_flow / 1000, 1);
+    BatchSetTextInt32 (4, opening_fun());
+    BatchEnd ();
+
+    SetScreen (PAGE_FlowSet);
+}
+
+static void H_P_FlowSet(void)
+{
+    uint16_t screen_id_temp = PAGE_FlowSet;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (3, (double) g_flow.para.flow_curr / 1000, 1);
+    BatchSetTextDouble (1, (double) g_flow.save.control_flow / 1000, 1);
+    BatchSetTextInt32 (4, opening_fun());
+    BatchEnd ();
+}
+
+static void H_O_FlowSet(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_FlowSet;
+    float temp_val = 0;
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 59)//开度值加减
+        {
+            g_flow.save.ctr_valve_opening = g_flow.save.ctr_valve_opening + 1;
+            if( g_flow.save.ctr_valve_opening >= 100)
+            {
+                g_flow.save.ctr_valve_opening = 100;
+            }
+            g_flow.para.Regulating_flow_mark = 0;
+            g_flow.para.flow_flag = 1;
+            g_pressure.pressure_over_sta = 0;
+            g_flow.para.allow_atuo_flow = 0;    //手动调整开度后 智能控制临时禁止
+        }
+        else if (page_control->control_id == 60)
+        {
+            g_flow.save.ctr_valve_opening = g_flow.save.ctr_valve_opening - 1;
+            if(g_flow.save.ctr_valve_opening <= 0)
+            {
+                g_flow.save.ctr_valve_opening = 0;
+            }
+            g_flow.para.Regulating_flow_mark = 0;
+            g_flow.para.flow_flag = 1;
+            g_pressure.pressure_over_sta = 0;
+            g_flow.para.allow_atuo_flow = 0;    //手动调整开度后 智能控制临时禁止
+        }
+    }
+    else if ((page_control->control_type == kCtrlText) && (page_control->screen_id == PAGE_FlowSet))
+    {
+        temp_val = (float) atof ((const char*) page_control->param_addr);
+        if (page_control->control_id == 1) //流量设置值
+        {
+            g_flow.save.control_flow = temp_val * 1000 ;
+            g_flow.para.Regulating_flow_mark = 1;
+            g_pressure.pressure_over_sta = 0;
+            g_flow.para.allow_atuo_flow = 1;    //设置控制流量值后，智能控制流量被打开
+        }
+        else if(page_control->control_id == 4)//开度值设置
+        {
+            if((int)(temp_val * 1000) == 0)
+                g_flow.save.ctr_valve_opening = -1;//全关
+            else
+                g_flow.save.ctr_valve_opening = (int)(temp_val);
+            g_flow.para.Regulating_flow_mark = 0;
+            g_pressure.pressure_over_sta = 0;
+            g_flow.para.flow_flag = 1;
+            g_flow.para.allow_atuo_flow = 0;    //手动调整开度后 智能控制临时禁止
+        }
+    }
+}
+
+
+/*
+ * 说明：主界面--控制流量已达上限提示
+ * 输入：无
+ * 输出：无
+ *
+ */
+static void H_F_PAGE_control_flow_upper(void)
+{
+    SetScreen (PAGE_control_flow_upper);
+}
+
+static void H_P_PAGE_control_flow_upper(void)
+{
+    ;
+}
+
+static void H_O_PAGE_control_flow_upper(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_control_flow_upper))
+    {
+        if (page_control->control_id == 3)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//趋势图
+static void H_F_TendencyChart(void)
+{
+    SetScreen (PAGE_TendencyChart);
+}
+
+static void H_P_TendencyChart(void)
+{
+    ;
+}
+
+static void H_O_TendencyChart(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_TendencyChart))
+    {
+        if (page_control->control_id == 15)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+////开泵
+//static void H_F_OpenPumpPage(void)
+//{
+//    //1.切换界面,进入主菜单界面
+//    SetScreen (PAGE_OpenPumpPage);
+//}
+//
+//static void H_P_OpenPumpPage(void)
+//{
+//    ;
+//}
+//
+//static void H_O_OpenPumpPage(PAGE_CONTROL *page_control)
+//{
+//    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_OpenPumpPage))
+//    {
+//        if (page_control->control_id == 1)
+//        {
+//            g_pump.save.pump_status = 1;
+//            App_Return_Main_Dis ();
+//        }
+//        if (page_control->control_id == 2)
+//        {
+//            g_pump.save.pump_status = 0;
+//            App_Return_Main_Dis ();
+//        }
+//
+//    }
+//}
+
+//打开测试
+static void H_F_OpenTest(void)
+{
+    uint16_t screen_id_temp = PAGE_OpenTest;
+
+    SetSelectorValue (screen_id_temp, 100, g_sensor_o2.data_para.val_1_sta);
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_OpenTest(void)
+{
+    ;
+}
+
+static void H_O_OpenTest(PAGE_CONTROL *page_control)
+{
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_OpenTest))
+    {
+        if (page_control->control_id == 1)
+        {
+            if( g_sensor_o2.data_para.val_1_sta == 0)
+            {
+                g_sensor_o2.data_para.count = 0;
+                g_sensor_o2.data_para.lock_start = 1;
+                g_sensor_o2.data_para.lock_count = 6;
+                g_sensor_o2.data_para.val_1_sta = 1;
+                g_alarm[2].run_para.al_3s = 0;
+                g_alarm[3].run_para.al_3s = 0;
+                g_alarm[2].run_para.ala_sta = 0;
+                g_alarm[3].run_para.ala_sta = 0;
+            }
+            else
+            {
+                g_sensor_o2.data_para.trend_count = 0;
+                g_sensor_o2.data_para.lock_count = 0;
+                g_sensor_o2.data_para.val_1_sta = 0;
+                g_sensor_o2.data_para.test_blow_change_flag = 0;
+            }
+            App_Menu_Page_Back();
+        }
+        if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back();
+        }
+    }
+}
+
+
+//权限界面
+static void H_F_permission_user_interface(void)
+{
+    uint16_t screen_id_temp = PAGE_permission_user_interface;
+    uint8_t i;
+    //权限显示（总共11个选项）
+    for (i = 0; i < 11; i++)
+    {
+        if (g_user_manage.para.now_user.user_root[i])    //现在的管理权限
+        {
+            AnimationPlayFrame (screen_id_temp, i + 70, g_user_manage.para.now_user.user_root[i] - 1);
+            SetControlVisiable (screen_id_temp, i + 70, 1);    //显示图标  1显示  0不显示
+        }
+        else
+        {
+            SetControlVisiable (screen_id_temp, i + 70, 0);
+            break;
+        }
+    }
+    for (; i < 11; i++)
+    {
+        SetControlVisiable (screen_id_temp, i + 70, 0);
+    }
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_permission_user_interface(void)
+{
+    ;
+}
+
+static void Permission_to_enter_the_interface(uint8_t Permission)    //根据不同权限进入不同的操作菜单
+{
+    //用户
+    if (Permission == base_set)    //基本设置
+        App_Menu_Page_Sw (PAGE_MainMenu);
+
+    else if (Permission == user_set)    //用户设置
+        App_Menu_Page_Sw (PAGE_Menu0124);
+
+    else if (Permission == dis_limit)    //显示限制
+    {
+        App_Menu_Page_Sw (PAGE_Menu1028Page);
+    }
+
+    //用户管理员
+    else if (Permission == user_manage)    //用户管理
+        App_Menu_Page_Sw (PAGE_User_management);
+
+    //工厂
+    else if (Permission == cal_list)    //标定记录
+        App_Menu_Page_Sw (PAGE_Menu0204);
+
+    else if (Permission == fac_set)    //工厂设置  0303
+        App_Menu_Page_Sw (PAGE_Menu0303);
+
+    //试用功能
+    else if (Permission == trial_func)
+        App_Menu_Page_Sw (PAGE_Authority_Set);
+
+    //输入输出设置
+    else if (Permission == I_O_set)
+    {
+        App_Menu_Page_Sw (PAGE_InOutput);
+    }
+    //仪器信息
+    else if (Permission == analyzer_info)
+    {
+        if (g_life.sensor.save.Verification_switch)    //开关
+            App_Menu_Page_Sw (PAGE_Infor_certificate);
+        else
+            App_Menu_Page_Sw (PAGE_Infor);
+    }
+    else if (Permission == user_cal)    //标定
+    {
+        App_Menu_Page_Sw (PAGE_Menu0918_DoubleO2);
+    }
+    else if (Permission == fac_cal)    //工厂设置 0330
+    {
+        App_Menu_Page_Sw (PAGE_Menu0330_DoubleO2_Cal_Para);
+    }
+}
+
+static void H_O_permission_user_interface(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_permission_user_interface;
+
+    if ((page_control->control_type == kCtrlIonc) && (page_control->screen_id == screen_id_temp))    //图标
+    {
+        if (page_control->control_id == 70)    //第一个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[0]);
+        }
+        else if (page_control->control_id == 71)    //第2个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[1]);
+        }
+        else if (page_control->control_id == 72)    //第3个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[2]);
+        }
+        else if (page_control->control_id == 73)    //第4个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[3]);
+        }
+        else if (page_control->control_id == 74)    //第5个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[4]);
+        }
+        else if (page_control->control_id == 75)    //第6个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[5]);
+        }
+        else if (page_control->control_id == 76)    //第7个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[6]);
+        }
+        else if (page_control->control_id == 77)    //第8个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[7]);
+        }
+        else if (page_control->control_id == 78)    //第9个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[8]);
+        }
+        else if (page_control->control_id == 79)    //第10个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[9]);
+        }
+        else if (page_control->control_id == 80)    //第11个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[10]);
+        }
+        else if (page_control->control_id == 81)    //第12个功能
+        {
+            Permission_to_enter_the_interface (g_user_manage.para.now_user.user_root[11]);
+        }
+    }
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+
+//主菜单-基本操作
+static void H_F_MainMenu(void)
+{
+    SetScreen (PAGE_MainMenu);
+}
+
+static void H_P_MainMenu(void)
+{
+    ;
+}
+
+static void H_O_MainMenu(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_MainMenu))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 1)
+        {
+            App_Menu_Page_Sw (PAGE_BasicSet);//屏幕设置
+        }
+
+        else if (page_control->control_id == 6)//数据存储
+        {
+            App_Menu_Page_Sw (PAGE_DataSave);
+            datasave_flag = 0;
+        }
+        else if (page_control->control_id == 8)//恢复设置界面
+        {
+            App_Menu_Page_Sw (PAGE_DataRecovery);
+        }
+    }
+}
+
+//屏幕设置
+static void H_F_BasicSet(void)
+{
+    uint16_t screen_id_temp = PAGE_BasicSet;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (16, g_hmi.save.light_upp);
+    BatchSetTextInt32 (15, g_hmi.save.light_low);
+    BatchSetTextInt32 (8, g_hmi.save.light_time);
+    if (g_hmi.save.language == 0) //中文
+    {
+        BatchSetFrame (3, 0);
+        BatchSetFrame (4, 1);
+    }
+    else
+    {
+        BatchSetFrame (3, 1);
+        BatchSetFrame (4, 0);
+    }
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_BasicSet(void)
+{
+    ;
+}
+
+static void H_O_BasicSet(PAGE_CONTROL *page_control)
+{
+    int u16val_temp = 0;
+    uint16_t screen_id_temp = PAGE_BasicSet;
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        sscanf ((const char*) page_control->param_addr, "%d", &u16val_temp);
+        if (page_control->control_id == 16)
+        {
+            if (u16val_temp > g_hmi.save.light_low)
+                g_hmi.save.light_upp = (uint16_t) u16val_temp;
+            else
+                App_Menu_Page_Sw (PAGE_Set_Error);
+        }
+        else if (page_control->control_id == 15)
+        {
+            if (u16val_temp < g_hmi.save.light_upp)
+                g_hmi.save.light_low = (uint16_t) u16val_temp;
+            else
+                App_Menu_Page_Sw (PAGE_Set_Error);
+        }
+        else if (page_control->control_id == 8)
+        {
+            g_hmi.save.light_time = (uint16_t) u16val_temp;
+        }
+        SetAutoLight (1, g_hmi.save.light_upp, g_hmi.save.light_low, g_hmi.save.light_time);
+    }
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 9)
+        {
+            g_hmi.save.language = 0;
+            SetLanguageToChinese ();
+            AnimationPlayFrame (screen_id_temp, 3, 0);
+            AnimationPlayFrame (screen_id_temp, 4, 1);
+        }
+        else if (page_control->control_id == 10)
+        {
+            g_hmi.save.language = 1;
+            SetLanguageToEnglish ();
+            AnimationPlayFrame (screen_id_temp, 3, 1);
+            AnimationPlayFrame (screen_id_temp, 4, 0);
+        }
+    }
+}
+
+//输入输出设置
+static void H_F_InOutput(void)
+{
+    SetScreen (PAGE_InOutput);
+}
+
+static void H_P_InOutput(void)
+{
+    ;
+}
+
+static void H_O_InOutput(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_InOutput))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 11)
+        {
+            App_Menu_Page_Sw (PAGE_AnalogOut12_Set);
+        }
+        //2.通讯端子
+        else if (page_control->control_id == 12)
+        {
+            App_Menu_Page_Sw (PAGE_Comms_PD);
+        }
+        //3.外部控制
+        else if (page_control->control_id == 13)
+        {
+            App_Menu_Page_Sw (PAGE_Ex_control);
+        }
+        //报警输出
+        else if (page_control->control_id == 14)
+        {
+            App_Menu_Page_Sw (PAGE_AlarmOutPutDefine);
+        }
+        //1.外部can通讯端口(待写)
+        else if (page_control->control_id == 21)
+        {
+           ;// App_Menu_Page_Sw (PAGE_Functional_undeveloped);
+        }
+        //2.模拟输入
+        else if (page_control->control_id == 22)
+        {
+            App_Menu_Page_Sw (PAGE_Analog_Input);
+        }
+
+        //USB存储设置
+        else if (page_control->control_id == 32)
+        {
+            App_Menu_Page_Sw (PAGE_DataSave);
+            datasave_flag = 0;        //更新数据
+        }
+        //2.网口
+        else if (page_control->control_id == 33)
+        {
+            App_Menu_Page_Sw (PAGE_InternetSet);
+        }
+        //DB9
+        else if (page_control->control_id == 34)
+        {
+            App_Menu_Page_Sw (PAGE_Comms_DB9);
+        }
+    }
+}
+
+//模拟输出设置
+static void H_F_AnalogOutPutSet12(void)
+{
+    SetScreen (PAGE_AnalogOut12_Set);
+}
+
+static void H_P_AnalogOutPutSet12(void)
+{
+    ;
+}
+
+static void H_O_AnalogOutPutSet12(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_AnalogOut12_Set))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        //1. 量程设置
+        else if (page_control->control_id == 1)
+        {
+           App_Menu_Page_Sw (PAGE_AnalogOutPut12);
+        }
+        //2. 输出设置
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Sw (PAGE_AnalogOutPut12_Adj);
+        }
+    }
+}
+
+//输出设置
+static void H_F_AnalogOutPut12(void)
+{
+    uint16_t screen_id_temp = PAGE_AnalogOutPut12;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (26, (double) *g_var_temp.analog.pointer_upp1 / g_var_temp.val_multi, g_var_temp.val_digits);
+    BatchSetTextDouble (27, (double) *g_var_temp.analog.pointer_low1 / g_var_temp.val_multi, g_var_temp.val_digits);
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_AnalogOutPut12(void)
+{
+    ;
+}
+
+static void H_O_AnalogOutPut12(PAGE_CONTROL *page_control)
+{
+    double fval_temp = 0;
+    int u32val_temp = 0;
+    uint16_t screen_id_temp = PAGE_AnalogOutPut12;
+    uint16_t id = page_control->control_id;
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fval_temp = (double) atof ((const char*) page_control->param_addr);
+        fval_temp *= g_var_temp.val_multi;
+        u32val_temp = (int32_t) fval_temp;
+
+        if (id == 26)
+        {
+            if (u32val_temp > (*g_var_temp.analog.pointer_low1) && u32val_temp <= g_var_temp.val_limit_upp && u32val_temp >= 0)
+            {
+                *g_var_temp.analog.pointer_upp1 = u32val_temp;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+        else if (page_control->control_id == 27)
+        {
+            if (u32val_temp < (*g_var_temp.analog.pointer_upp1) && u32val_temp >= g_var_temp.val_limit_low && u32val_temp >=0)
+            {
+                *g_var_temp.analog.pointer_low1 = u32val_temp;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+
+        BatchBegin (screen_id_temp);
+        BatchSetTextDouble (26, (double) *g_var_temp.analog.pointer_upp1 / g_var_temp.val_multi,g_var_temp.val_digits);
+        BatchSetTextDouble (27, (double) *g_var_temp.analog.pointer_low1 / g_var_temp.val_multi,g_var_temp.val_digits);
+        BatchEnd ();
+    }
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+             App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+
+//模拟输出校准
+uint8_t adj_chnanel = 0;
+static void H_F_AnalogOutPutAdj12(void)
+{
+    uint16_t screen_id_temp = PAGE_AnalogOutPut12_Adj;
+
+    adj_chnanel = 0;
+    SetSelectorValue (screen_id_temp, 7, adj_chnanel);        //输出0
+    SetSelectorValue (screen_id_temp, 1, g_analog[adj_chnanel].save.mode);        // 输出0模式
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (2, (uint32_t) g_analog[adj_chnanel].save.adj_0ma_o2);
+    BatchSetTextInt32 (3, (uint32_t) g_analog[adj_chnanel].save.adj_4ma_o2);
+    BatchSetTextInt32 (16, (uint32_t) g_analog[adj_chnanel].save.adj_20ma_o2);
+    BatchSetTextInt32 (12, (uint32_t) g_analog[adj_chnanel].save.adj_0v_o2);
+    BatchSetTextInt32 (13, (uint32_t) g_analog[adj_chnanel].save.adj_1v_o2);
+    BatchSetTextInt32 (27, (uint32_t) g_analog[adj_chnanel].save.adj_5v_o2);
+    BatchSetTextInt32 (32, (uint32_t) g_analog[adj_chnanel].save.adj_10v_o2);
+    BatchEnd ();
+
+    SetSelectorValue (screen_id_temp, 4, 0);        //0mA
+    SetSelectorValue (screen_id_temp, 5, 1);        //
+    SetSelectorValue (screen_id_temp, 11, 2);        //
+    SetSelectorValue (screen_id_temp, 14, 3);        //0v
+    SetSelectorValue (screen_id_temp, 15, 4);        //
+    SetSelectorValue (screen_id_temp, 18, 5);        //
+    SetSelectorValue (screen_id_temp, 19, 6);        //
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_AnalogOutPutAdj12(void)
+{
+    ;
+}
+
+/*
+ *说明：用于按键调整  analog_mode
+ *输入：模拟结构体：analog_mode   adj_mode校准模式选择    ch增减选择  0增加  1减少
+ */
+//static void adj_analog_set(ANALOG_ADJ adj_mode, uint8_t ch)
+//{
+//
+//    if (ch == 0)
+//    {
+//        switch (adj_mode)
+//        {
+//            case analog_adj_0ma_o2:
+//            {
+//                g_analog[adj_chnanel].save.adj_0ma_o2 += 5;
+//                if (g_analog[adj_chnanel].save.adj_0ma_o2 > 60000)
+//                    g_analog[adj_chnanel].save.adj_0ma_o2 = 60000;
+//            }
+//            break;
+//            case analog_adj_4ma_o2:
+//            {
+//                g_analog[adj_chnanel].save.adj_4ma_o2 += 5;
+//                if (g_analog[adj_chnanel].save.adj_4ma_o2 > 60000)
+//                    g_analog[adj_chnanel].save.adj_4ma_o2 = 60000;
+//            }
+//            break;
+//            case analog_adj_20ma_o2:
+//            {
+//                g_analog[adj_chnanel].save.adj_20ma_o2 += 5;
+//                if (g_analog[adj_chnanel].save.adj_20ma_o2 > 60000)
+//                    g_analog[adj_chnanel].save.adj_20ma_o2 = 60000;
+//            }
+//            break;
+//            case analog_adj_0v_o2:
+//            {
+//                g_analog[adj_chnanel].save.adj_0v_o2 += 5;
+//                if (g_analog[adj_chnanel].save.adj_0v_o2 > 60000)
+//                    g_analog[adj_chnanel].save.adj_0v_o2 = 60000;
+//            }
+//            break;
+//            case analog_adj_1v_o2:
+//            {
+//                g_analog[adj_chnanel].save.adj_1v_o2 += 5;
+//                if (g_analog[adj_chnanel].save.adj_1v_o2 > 60000)
+//                    g_analog[adj_chnanel].save.adj_1v_o2 = 60000;
+//            }
+//            break;
+//            case analog_adj_5v_o2:
+//            {
+//                g_analog[adj_chnanel].save.adj_5v_o2 += 5;
+//                if (g_analog[adj_chnanel].save.adj_5v_o2 > 60000)
+//                    g_analog[adj_chnanel].save.adj_5v_o2 = 60000;
+//            }
+//            break;
+//            case analog_adj_10v_o2:
+//            {
+//                g_analog[adj_chnanel].save.adj_10v_o2 += 5;
+//                if (g_analog[adj_chnanel].save.adj_10v_o2 > 60000)
+//                    g_analog[adj_chnanel].save.adj_10v_o2 = 60000;
+//            }
+//            break;
+//            default:
+//            {
+//                ;
+//            }
+//            break;
+//        }
+//    }
+//    else
+//    {
+//        switch (adj_mode)
+//        {
+//            case analog_adj_0ma_o2:
+//            {
+//                if (g_analog[adj_chnanel].save.adj_0ma_o2 >= 5)
+//                    g_analog[adj_chnanel].save.adj_0ma_o2 -= 5;
+//                else
+//                    g_analog[adj_chnanel].save.adj_0ma_o2 = 0;
+//            }
+//            break;
+//            case analog_adj_4ma_o2:
+//            {
+//                if (g_analog[adj_chnanel].save.adj_4ma_o2 >= 5)
+//                    g_analog[adj_chnanel].save.adj_4ma_o2 -= 5;
+//                else
+//                    g_analog[adj_chnanel].save.adj_4ma_o2 = 0;
+//            }
+//            break;
+//            case analog_adj_20ma_o2:
+//            {
+//                if (g_analog[adj_chnanel].save.adj_20ma_o2 >= 5)
+//                    g_analog[adj_chnanel].save.adj_20ma_o2 -= 5;
+//                else
+//                    g_analog[adj_chnanel].save.adj_20ma_o2 = 0;
+//            }
+//            break;
+//            case analog_adj_0v_o2:
+//            {
+//                if (g_analog[adj_chnanel].save.adj_0v_o2 >= 5)
+//                    g_analog[adj_chnanel].save.adj_0v_o2 -= 5;
+//                else
+//                    g_analog[adj_chnanel].save.adj_0v_o2 = 0;
+//            }
+//            break;
+//            case analog_adj_1v_o2:
+//            {
+//                if (g_analog[adj_chnanel].save.adj_1v_o2 >= 5)
+//                    g_analog[adj_chnanel].save.adj_1v_o2 -= 5;
+//                else
+//                    g_analog[adj_chnanel].save.adj_1v_o2 = 0;
+//            }
+//            break;
+//            case analog_adj_5v_o2:
+//            {
+//                if (g_analog[adj_chnanel].save.adj_5v_o2 >= 5)
+//                    g_analog[adj_chnanel].save.adj_5v_o2 -= 5;
+//                else
+//                    g_analog[adj_chnanel].save.adj_5v_o2 = 0;
+//            }
+//            break;
+//            case analog_adj_10v_o2:
+//            {
+//                if (g_analog[adj_chnanel].save.adj_10v_o2 >= 5)
+//                    g_analog[adj_chnanel].save.adj_10v_o2 -= 5;
+//                else
+//                    g_analog[adj_chnanel].save.adj_10v_o2 = 0;
+//            }
+//            break;
+//            default:
+//            {
+//                ;
+//            }
+//            break;
+//        }
+//    }
+//    g_analog[adj_chnanel].para.adj_sw = 1;
+//    g_analog[adj_chnanel].para.adj_mode = adj_mode;
+//    g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//}
+
+//static void H_O_AnalogOutPutAdj12(PAGE_CONTROL *page_control)
+//{
+//    uint16_t screen_id_temp = PAGE_AnalogOutPut12_Adj;
+//    int value = 0;
+//
+//    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+//    {
+//        sscanf ((const char*) page_control->param_addr, "%d", &value);
+//
+//        if (page_control->control_id == 2)
+//        {
+//            g_analog[adj_chnanel].para.adj_sw = 1;
+//            g_analog[adj_chnanel].para.adj_mode = analog_adj_0ma_o2;
+//            g_analog[adj_chnanel].save.adj_0ma_o2 = (uint16_t) value;
+//            g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//        }
+//        else if (page_control->control_id == 3)
+//        {
+//            g_analog[adj_chnanel].para.adj_sw = 1;
+//            g_analog[adj_chnanel].para.adj_mode = analog_adj_4ma_o2;
+//            g_analog[adj_chnanel].save.adj_4ma_o2 = (uint16_t) value;
+//            g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//        }
+//        else if (page_control->control_id == 16)
+//        {
+//            g_analog[adj_chnanel].para.adj_sw = 1;
+//            g_analog[adj_chnanel].para.adj_mode = analog_adj_20ma_o2;
+//            g_analog[adj_chnanel].save.adj_20ma_o2 = (uint16_t) value;
+//            g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//        }
+//        else if (page_control->control_id == 12)
+//        {
+//            g_analog[adj_chnanel].para.adj_sw = 1;
+//            g_analog[adj_chnanel].para.adj_mode = analog_adj_0v_o2;
+//            g_analog[adj_chnanel].save.adj_0v_o2 = (uint16_t) value;
+//            g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//        }
+//        else if (page_control->control_id == 13)
+//        {
+//            g_analog[adj_chnanel].para.adj_sw = 1;
+//            g_analog[adj_chnanel].para.adj_mode = analog_adj_1v_o2;
+//            g_analog[adj_chnanel].save.adj_1v_o2 = (uint16_t) value;
+//            g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//        }
+//        else if (page_control->control_id == 27)
+//        {
+//            g_analog[adj_chnanel].para.adj_sw = 1;
+//            g_analog[adj_chnanel].para.adj_mode = analog_adj_5v_o2;
+//            g_analog[adj_chnanel].save.adj_5v_o2 = (uint16_t) value;
+//            g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//        }
+//        else if (page_control->control_id == 32)
+//        {
+//            g_analog[adj_chnanel].para.adj_sw = 1;
+//            g_analog[adj_chnanel].para.adj_mode = analog_adj_10v_o2;
+//            g_analog[adj_chnanel].save.adj_10v_o2 = (uint16_t) value;
+//            g_analog[adj_chnanel].para.adj_time = ANALOG_ADJ_TIME;
+//        }
+//    }
+//
+//    if ((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))        //下拉菜单
+//    {
+//        if (page_control->control_id == 17)   //模式
+//        {
+//            g_analog[adj_chnanel].save.mode = *page_control->param_addr;
+//        }
+//    }
+//
+//    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+//    {
+//        if (page_control->control_id == 21)
+//        {
+//            adj_analog_set (analog_adj_0ma_o2, 0);
+//            SetTextValueInt32 (screen_id_temp, 2, (uint16_t) g_analog[adj_chnanel].save.adj_0ma_o2);
+//        }
+//        else if (page_control->control_id == 22)
+//        {
+//            adj_analog_set (analog_adj_0ma_o2, 1);
+//            SetTextValueInt32 (screen_id_temp, 2, (uint16_t) g_analog[adj_chnanel].save.adj_0ma_o2);
+//        }
+//
+//        else if (page_control->control_id == 23)
+//        {
+//            adj_analog_set (analog_adj_4ma_o2, 0);
+//            SetTextValueInt32 (screen_id_temp, 3, (uint32_t) g_analog[adj_chnanel].save.adj_4ma_o2);
+//        }
+//        else if (page_control->control_id == 24)
+//        {
+//            adj_analog_set (analog_adj_4ma_o2, 1);
+//            SetTextValueInt32 (screen_id_temp, 3, (uint32_t) g_analog[adj_chnanel].save.adj_4ma_o2);
+//        }
+//
+//        else if (page_control->control_id == 55)
+//        {
+//            adj_analog_set (analog_adj_20ma_o2, 0);
+//            SetTextValueInt32 (screen_id_temp, 16, (uint32_t) g_analog[adj_chnanel].save.adj_20ma_o2);
+//        }
+//        else if (page_control->control_id == 56)
+//        {
+//            adj_analog_set (analog_adj_20ma_o2, 1);
+//            SetTextValueInt32 (screen_id_temp, 16, (uint32_t) g_analog[adj_chnanel].save.adj_20ma_o2);
+//        }
+//
+//        else if (page_control->control_id == 57)
+//        {
+//            adj_analog_set (analog_adj_0v_o2, 0);
+//            SetTextValueInt32 (screen_id_temp, 12, (uint32_t) g_analog[adj_chnanel].save.adj_0v_o2);
+//        }
+//        else if (page_control->control_id == 58)
+//        {
+//            adj_analog_set (analog_adj_0v_o2, 1);
+//            SetTextValueInt32 (screen_id_temp, 12, (uint32_t) g_analog[adj_chnanel].save.adj_0v_o2);
+//        }
+//
+//        else if (page_control->control_id == 59)
+//        {
+//            adj_analog_set (analog_adj_1v_o2, 0);
+//            SetTextValueInt32 (screen_id_temp, 13, (uint32_t) g_analog[adj_chnanel].save.adj_1v_o2);
+//        }
+//        else if (page_control->control_id == 60)
+//        {
+//            adj_analog_set (analog_adj_1v_o2, 1);
+//            SetTextValueInt32 (screen_id_temp, 13, (uint32_t) g_analog[adj_chnanel].save.adj_1v_o2);
+//        }
+//
+//        else if (page_control->control_id == 61)
+//        {
+//            adj_analog_set (analog_adj_5v_o2, 0);
+//            SetTextValueInt32 (screen_id_temp, 27, (uint32_t) g_analog[adj_chnanel].save.adj_5v_o2);
+//        }
+//        else if (page_control->control_id == 62)
+//        {
+//            adj_analog_set (analog_adj_5v_o2, 1);
+//            SetTextValueInt32 (screen_id_temp, 27, (uint32_t) g_analog[adj_chnanel].save.adj_5v_o2);
+//        }
+//
+//        else if (page_control->control_id == 63)
+//        {
+//            adj_analog_set (analog_adj_10v_o2, 0);
+//            SetTextValueInt32 (screen_id_temp, 32, (uint32_t) g_analog[adj_chnanel].save.adj_10v_o2);
+//        }
+//        else if (page_control->control_id == 64)
+//        {
+//            adj_analog_set (analog_adj_10v_o2, 1);
+//            SetTextValueInt32 (screen_id_temp, 32, (uint32_t) g_analog[adj_chnanel].save.adj_10v_o2);
+//        }
+//        else if (page_control->control_id == BUTTON_RETURN)    //返回上一级菜单
+//        {
+//            App_Menu_Page_Back ();
+//        }
+//        else if (page_control->control_id == BUTTON_MAIN)    //返回主界面
+//        {
+//            App_Return_Main_Dis ();
+//        }
+//    }
+//}
+//
+////外部控制设置
+//static void H_F_Ex_control(void)
+//{
+//    uint16_t screen_id_temp = PAGE_Ex_control;
+//
+//    SetSelectorValue (screen_id_temp, 10, g_pump.save.exter_pump_control);
+//    SetScreen (screen_id_temp);
+//}
+
+static void H_P_Ex_control(void)
+{
+    ;
+}
+
+//static void H_O_Ex_control(PAGE_CONTROL *page_control)
+//{
+//    uint16_t screen_id_temp = PAGE_Ex_control;
+//
+//    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))   //通讯界面
+//    {
+//        if (page_control->control_id == BUTTON_RETURN)
+//        {
+//            App_Menu_Page_Back ();
+//        }
+//        else if (page_control->control_id == BUTTON_MAIN)
+//        {
+//            App_Return_Main_Dis ();
+//        }
+//    }
+//    else if ((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+//    {
+//        if (page_control->control_id == 11)
+//        {
+//            g_pump.save.exter_pump_control = *page_control->param_addr;
+//           // SetSelectorValue (screen_id_temp, 10, g_pump.save.exter_pump_control);
+//        }
+//    }
+//}
+
+//端口通讯设置
+static void H_F_Comms_PD(void)
+{
+    uint16_t screen_id_temp = PAGE_Comms_PD;
+
+    AnimationPlayFrame (screen_id_temp, 87, g_modbus.save.rs485_res);
+    SetTextValueInt32 (screen_id_temp, 6, g_modbus.save.addr);
+    SetSelectorValue (screen_id_temp, 12, g_modbus.save.rs485_rs232);
+    SetSelectorValue (screen_id_temp, 40, g_modbus.save.baud);
+    SetSelectorValue (screen_id_temp, 8, g_modbus.save.parity);
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Comms_PD(void)
+{
+    ;
+}
+
+static void H_O_Comms_PD(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Comms_PD;
+    int value = 0;
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 6)
+        {
+            sscanf ((const char*) page_control->param_addr, "%d", &value);
+            g_modbus.save.addr = (uint8_t) value;
+        }
+    }
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 86)
+        {
+            if (g_modbus.save.rs485_res == 0)
+                g_modbus.save.rs485_res = 1;
+            else
+                g_modbus.save.rs485_res = 0;
+            AnimationPlayFrame (screen_id_temp, 87, g_modbus.save.rs485_res);
+            App_Modbus_Init();
+        }
+    }
+
+    if ((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 16)
+        {
+            g_modbus.save.baud = *page_control->param_addr;
+            App_Modbus_Init ();   //初始化通讯
+        }
+        else if (page_control->control_id == 15)
+        {
+            g_modbus.save.parity = *page_control->param_addr;
+            App_Modbus_Init ();   //初始化通讯
+        }
+        else if (page_control->control_id == 13)
+        {
+            g_modbus.save.rs485_rs232 = *page_control->param_addr;
+            App_Modbus_Init ();   //初始化通讯
+        }
+    }
+}
+
+//报警设置
+static void H_F_AlarmOutPutDefine(void)
+{
+    uint16_t screen_id_temp = PAGE_AlarmOutPutDefine, i;
+
+    SetSelectorValue (screen_id_temp, 149, g_var_temp.alarm_class->alarm_selection);
+    SetSelectorValue (screen_id_temp, 148, (g_var_temp.alarm_class + 1)->alarm_selection);
+    SetSelectorValue (screen_id_temp, 146, g_var_temp.alarm_class->alarm_mode);
+    SetSelectorValue (screen_id_temp, 161, (g_var_temp.alarm_class + 1)->alarm_mode);
+    SetSelectorValue (screen_id_temp, 175, g_var_temp.alarm_class->relay_mode);
+    SetSelectorValue (screen_id_temp, 180, (g_var_temp.alarm_class + 1)->relay_mode);
+
+    BatchBegin (screen_id_temp);
+    for (i = 0; i < 2; i++)
+    {
+        BatchSetTextFloat (210 + 3 * i, (double) (g_var_temp.alarm_class + i)->val / g_var_temp.val_multi,g_var_temp.val_digits);
+        BatchSetTextFloat (211 + 3 * i, (double) (g_var_temp.alarm_class + i)->scope_upp / g_var_temp.val_multi, g_var_temp.val_digits);
+        BatchSetTextFloat (212 + 3 * i, (double) (g_var_temp.alarm_class + i)->scope_low / g_var_temp.val_multi, g_var_temp.val_digits);
+    }
+    BatchEnd ();
+
+    SetTextValueFloat (screen_id_temp, 15, g_flow.save.flow_alarm_upp / 1000, 1);
+    SetTextValueFloat (screen_id_temp, 22, g_flow.save.flow_alarm_low / 1000, 1);
+    SetTextValueFloat(screen_id_temp, 40,g_flow.save.pressure_alarm_upp,1);
+    SetTextValueFloat(screen_id_temp, 43,g_flow.save.pressure_alarm_low,1);
+    AnimationPlayFrame(screen_id_temp, 11,g_flow.save.flow_alarm_sw);
+    AnimationPlayFrame(screen_id_temp, 18,g_flow.save.pressure_alarm_sw);
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_AlarmOutPutDefine(void)
+{
+    ;
+}
+
+static void H_O_AlarmOutPutDefine(PAGE_CONTROL *page_control)
+{
+    double fval_temp = 0;
+    int u32val_temp = 0;
+    uint16_t screen_id_temp = PAGE_AlarmOutPutDefine;
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fval_temp = (double) atof ((const char*) page_control->param_addr);
+        fval_temp *= g_var_temp.val_multi;
+        if (*g_var_temp.sensor.pointer_unit_val == unit_percent)
+            fval_temp *= beishu_unit;
+
+        u32val_temp = (int32_t) fval_temp;
+        switch (page_control->control_id)
+        {
+            case 210:
+            {
+                if (u32val_temp >= g_var_temp.val_limit_low && u32val_temp <= g_var_temp.val_limit_upp && u32val_temp >=0)
+                    g_var_temp.alarm_class->val =  u32val_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            break;
+            case 211:
+            {
+                if (u32val_temp > g_var_temp.alarm_class->scope_low && u32val_temp <= g_var_temp.val_limit_upp && u32val_temp >=0)
+                    g_var_temp.alarm_class->scope_upp =  u32val_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            break;
+            case 212:
+            {
+                if (u32val_temp >= g_var_temp.val_limit_low && u32val_temp < g_var_temp.alarm_class->scope_upp && u32val_temp >=0)
+                    g_var_temp.alarm_class->scope_low =  u32val_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            break;
+            case 213:
+            {
+                if (u32val_temp >= g_var_temp.val_limit_low && u32val_temp <= g_var_temp.val_limit_upp && u32val_temp >=0)
+                    (g_var_temp.alarm_class + 1)->val =  u32val_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            break;
+            case 214:
+            {
+                if (u32val_temp > (g_var_temp.alarm_class + 1)->scope_low && u32val_temp <= g_var_temp.val_limit_upp && u32val_temp >=0)
+                    (g_var_temp.alarm_class + 1)->scope_upp =  u32val_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            break;
+            case 215:
+            {
+                if (u32val_temp >= g_var_temp.val_limit_low && u32val_temp < (g_var_temp.alarm_class + 1)->scope_upp && u32val_temp >=0)
+                    (g_var_temp.alarm_class + 1)->scope_low =  u32val_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            break;
+
+            default:break;
+        }
+
+        fval_temp = (float) atof ((const char*) page_control->param_addr);
+        if (page_control->control_id == 15)
+        {
+            if(fval_temp * 1000 > g_flow.save.flow_alarm_low &&  fval_temp * 1000 <= 100000)
+                g_flow.save.flow_alarm_upp = (float) (fval_temp*1000);
+            else
+                App_Menu_Page_Sw(PAGE_Set_Error);
+        }
+        else if (page_control->control_id == 22)
+        {
+            if(fval_temp * 1000 < g_flow.save.flow_alarm_upp &&  fval_temp * 1000 >= 0)
+                g_flow.save.flow_alarm_low = (float) (fval_temp*1000);
+            else
+                App_Menu_Page_Sw(PAGE_Set_Error);
+        }
+        else if (page_control->control_id == 40)
+        {
+            if(fval_temp > g_flow.save.pressure_alarm_low &&  fval_temp <= 300)
+                g_flow.save.pressure_alarm_upp = (float) fval_temp;
+            else
+                App_Menu_Page_Sw(PAGE_Set_Error);
+        }
+        else if (page_control->control_id == 43)
+        {
+            if(fval_temp < g_flow.save.pressure_alarm_upp &&  fval_temp >= 0)
+                g_flow.save.pressure_alarm_low = (float) fval_temp;
+            else
+                App_Menu_Page_Sw(PAGE_Set_Error);
+        }
+    }
+    //菜单
+    if ((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 6)
+        {
+            g_var_temp.alarm_class->alarm_selection = *page_control->param_addr;
+        }
+        else if (page_control->control_id == 5)
+        {
+            (g_var_temp.alarm_class + 1)->alarm_selection = *page_control->param_addr;
+        }
+
+        else if (page_control->control_id == 20)
+        {
+            g_var_temp.alarm_class->alarm_mode = *page_control->param_addr;
+        }
+        else if (page_control->control_id == 4)
+        {
+            (g_var_temp.alarm_class + 1)->alarm_mode = *page_control->param_addr;
+        }
+
+        else if (page_control->control_id == 222)
+        {
+            g_var_temp.alarm_class->relay_mode = *page_control->param_addr;
+        }
+        else if (page_control->control_id == 1)
+        {
+            (g_var_temp.alarm_class + 1)->relay_mode = *page_control->param_addr;
+        }
+    }
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 12)
+        {
+            if(g_flow.save.flow_alarm_sw == 0)
+                g_flow.save.flow_alarm_sw = 1;
+            else
+                g_flow.save.flow_alarm_sw = 0;
+            AnimationPlayFrame(screen_id_temp, 11,g_flow.save.flow_alarm_sw);
+        }
+        else if (page_control->control_id == 21)
+        {
+            if(g_flow.save.pressure_alarm_sw == 0)
+                g_flow.save.pressure_alarm_sw = 1;
+            else
+                g_flow.save.pressure_alarm_sw = 0;
+            AnimationPlayFrame(screen_id_temp, 18,g_flow.save.pressure_alarm_sw);
+        }
+    }
+}
+//网口设置
+uint16_t internet_temp[13];    //暂存设置参数
+static void H_F_InternetSet(void)
+{
+    uint16_t screen_id_temp = PAGE_InternetSet, i;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (18, (int32_t) g_net_modbus.save.addr); //运行时间
+    internet_temp[0] = g_net.save.net_communition_para.port_num; //端口
+    internet_temp[1] = g_net.save.net_communition_para.ip_address[0]; //ip
+    internet_temp[2] = g_net.save.net_communition_para.ip_address[1];
+    internet_temp[3] = g_net.save.net_communition_para.ip_address[2];
+    internet_temp[4] = g_net.save.net_communition_para.ip_address[3];
+
+    internet_temp[5] = g_net.save.net_communition_para.gateway[0]; //网关
+    internet_temp[6] = g_net.save.net_communition_para.gateway[1];
+    internet_temp[7] = g_net.save.net_communition_para.gateway[2];
+    internet_temp[8] = g_net.save.net_communition_para.gateway[3];
+
+    internet_temp[9] = g_net.save.net_communition_para.subnet_mask[0]; //子网掩码
+    internet_temp[10] = g_net.save.net_communition_para.subnet_mask[1];
+    internet_temp[11] = g_net.save.net_communition_para.subnet_mask[2];
+    internet_temp[12] = g_net.save.net_communition_para.subnet_mask[3];
+
+    for (i = 0; i < 13; i++)
+        BatchSetTextInt32 (40 + i, internet_temp[i]);
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_InternetSet(void)
+{
+    ;
+}
+
+static void H_O_InternetSet(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_InternetSet;
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        int value = 0;
+        if (page_control->control_id >= 40 && page_control->control_id <= 52)
+        {
+            sscanf ((const char*) page_control->param_addr, "%d", &value);
+            if (value > 255)
+                value = 255;
+            if (value < 0)
+                value = 0;
+            internet_temp[page_control->control_id - 40] = (uint16_t) value;
+        }
+        else if (page_control->control_id == 18)
+        {
+            sscanf ((const char*) page_control->param_addr, "%d", &value);
+            if (value < 0)
+                value = 0;
+            g_net_modbus.save.addr = (uint8_t) value;
+        }
+    }
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 12)
+        {
+            App_Menu_Page_Sw (PAGE_InternetSet_Ensure);
+        }
+    }
+}
+
+//网络设置确定
+static void H_F_InternetSet_Ensure(void)
+{
+    SetScreen (PAGE_InternetSet_Ensure);
+}
+
+static void H_P_InternetSet_Ensure(void)
+{
+    ;
+}
+
+static void H_O_InternetSet_Ensure(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_InternetSet_Ensure;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 1)
+        {
+            g_net.save.net_communition_para.port_num = internet_temp[0]; //端口
+            g_net.save.net_communition_para.ip_address[0] = (uint8_t) internet_temp[1]; //ip
+            g_net.save.net_communition_para.ip_address[1] = (uint8_t) internet_temp[2];
+            g_net.save.net_communition_para.ip_address[2] = (uint8_t) internet_temp[3];
+            g_net.save.net_communition_para.ip_address[3] = (uint8_t) internet_temp[4];
+
+            g_net.save.net_communition_para.gateway[0] = (uint8_t) internet_temp[5]; //网关
+            g_net.save.net_communition_para.gateway[1] = (uint8_t) internet_temp[6];
+            g_net.save.net_communition_para.gateway[2] = (uint8_t) internet_temp[7];
+            g_net.save.net_communition_para.gateway[3] = (uint8_t) internet_temp[8];
+
+            g_net.save.net_communition_para.subnet_mask[0] = (uint8_t) internet_temp[9]; //子网掩码
+            g_net.save.net_communition_para.subnet_mask[1] = (uint8_t) internet_temp[10];
+            g_net.save.net_communition_para.subnet_mask[2] = (uint8_t) internet_temp[11];
+            g_net.save.net_communition_para.subnet_mask[3] = (uint8_t) internet_temp[12];
+
+            g_net.para.net_init_flag = 1; //重置网络
+            App_Menu_Page_Sw (PAGE_Waiting); //等待
+            menu_waiting = menu_internet_set;
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//DB9通讯设置
+static void H_F_Comms_DB9(void)
+{
+    uint16_t screen_id_temp = PAGE_Comms_DB9;
+
+    AnimationPlayFrame(screen_id_temp, 87, g_db9_modbus.save.rs485_res);
+    SetTextValueInt32(screen_id_temp, 64, g_db9_modbus.save.addr);
+    SetSelectorValue(screen_id_temp, 74, g_db9_modbus.save.baud);
+    SetSelectorValue(screen_id_temp, 76, g_db9_modbus.save.parity);
+    SetSelectorValue(screen_id_temp, 13, g_db9_modbus.save.rs485_rs232);//通讯切换 0 485   1 232
+    SetScreen(screen_id_temp);
+}
+
+static void H_P_Comms_DB9(void)
+{
+    ;
+}
+
+static void H_O_Comms_DB9(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Comms_DB9;
+    int value = 0;
+
+    if((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == 64)
+        {
+            sscanf((const char *)page_control->param_addr, "%d", &value);
+            g_db9_modbus.save.addr = (uint8_t)value;
+        }
+    }
+    if((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis();
+        }
+        else if(page_control->control_id == 86)
+        {
+            if(g_db9_modbus.save.rs485_res == 0)
+                g_db9_modbus.save.rs485_res = 1;
+            else
+                g_db9_modbus.save.rs485_res = 0;
+            AnimationPlayFrame(screen_id_temp, 87, g_db9_modbus.save.rs485_res);
+            app_db9_Modbus_Init();//db9初始化
+        }
+    }
+    if((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+    {
+        //db9通讯
+        if(page_control->control_id == 79)
+        {
+            g_db9_modbus.save.baud = *page_control->param_addr;
+            app_db9_Modbus_Init();//db9初始化
+        }
+        else if(page_control->control_id == 78)
+        {
+            g_db9_modbus.save.parity = *page_control->param_addr;
+            app_db9_Modbus_Init();//db9初始化
+        }
+        else if(page_control->control_id == 16)
+        {
+            g_db9_modbus.save.rs485_rs232 = *page_control->param_addr;
+            app_db9_Modbus_Init();//db9初始化
+        }
+    }
+}
+
+//模拟输入采集
+static void H_F_Analog_Input(void)
+{
+    uint16_t screen_id_temp = PAGE_Analog_Input;
+
+    SetSelectorValue (screen_id_temp, 24, g_analog_input[0].save.collection_type);
+    SetSelectorValue (screen_id_temp, 32, g_analog_input[1].save.collection_type);
+    SetSelectorValue (screen_id_temp, 19, g_analog_input[0].save.unit);
+    SetSelectorValue (screen_id_temp, 4, g_analog_input[1].save.unit);
+
+    BatchBegin (screen_id_temp);
+    BatchSetFrame (3, g_analog_input[0].save.collection_switch);
+    BatchSetFrame (22, g_analog_input[1].save.collection_switch);
+    BatchEnd ();
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextFloat (26, g_analog_input[0].save.in_upp_range, g_var_temp.val_digits);
+    BatchSetTextFloat (27, g_analog_input[0].save.in_low_range, g_var_temp.val_digits);
+    BatchSetTextFloat (12, g_analog_input[1].save.in_upp_range, g_var_temp.val_digits);
+    BatchSetTextFloat (14, g_analog_input[1].save.in_low_range, g_var_temp.val_digits);
+
+    BatchSetTextFloat (70, g_analog_input[0].para.input_signal, 2);
+    BatchSetTextFloat (71, g_analog_input[0].para.input_value, 2);
+    BatchSetTextFloat (73, g_analog_input[1].para.input_signal, 2);
+    BatchSetTextFloat (72, g_analog_input[1].para.input_value, 2);
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Analog_Input(void)
+{
+    uint16_t screen_id_temp = PAGE_Analog_Input;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextFloat (70, g_analog_input[0].para.input_signal, 2);
+    BatchSetTextFloat (71, g_analog_input[0].para.input_value, 2);
+    BatchSetTextFloat (73, g_analog_input[1].para.input_signal, 2);
+    BatchSetTextFloat (72, g_analog_input[1].para.input_value, 2);
+    BatchEnd ();
+}
+
+static void H_O_Analog_Input(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Analog_Input;
+    double temp_val = 0;
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 2)   //模式切换
+        {
+            if (g_analog_input[0].save.collection_switch == 0)
+                g_analog_input[0].save.collection_switch = 1;
+            else
+                g_analog_input[0].save.collection_switch = 0;
+            BatchBegin (screen_id_temp);
+            BatchSetFrame (3, g_analog_input[0].save.collection_switch);
+            BatchEnd ();
+        }
+        else if (page_control->control_id == 21)   //模式切换
+        {
+            if (g_analog_input[1].save.collection_switch == 0)
+                g_analog_input[1].save.collection_switch = 1;
+            else
+                g_analog_input[1].save.collection_switch = 0;
+            BatchBegin (screen_id_temp);
+            BatchSetFrame (22, g_analog_input[1].save.collection_switch);
+            BatchEnd ();
+        }
+    }
+    else if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        temp_val = (double) atof ((const char*) page_control->param_addr);
+        if (temp_val > 0)
+            temp_val += 0.00001f;    //字符串转float
+        else if (temp_val < 0)
+            temp_val -= 0.00001f;    //字符串转float
+
+        if (page_control->control_id == 26)
+        {
+            if (temp_val > g_analog_input[0].save.in_low_range && temp_val >= 0 && temp_val < 1000000)
+            {
+                g_analog_input[0].save.in_upp_range = temp_val;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+        else if (page_control->control_id == 27)
+        {
+            if (temp_val < g_analog_input[0].save.in_upp_range && temp_val >= 0 && temp_val < 1000000)
+            {
+                g_analog_input[0].save.in_low_range = temp_val;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+        else if (page_control->control_id == 12)
+        {
+            if (temp_val > g_analog_input[1].save.in_low_range && temp_val >= 0 && temp_val < 1000000)
+            {
+                g_analog_input[1].save.in_upp_range = temp_val;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+        else if (page_control->control_id == 14)
+        {
+            if (temp_val < g_analog_input[1].save.in_upp_range && temp_val >= 0 && temp_val < 1000000)
+            {
+                g_analog_input[1].save.in_low_range = temp_val;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+    }
+    else if ((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 42)
+        {
+            g_analog_input[0].save.collection_type = *page_control->param_addr;
+        }
+        else if (page_control->control_id == 39)
+        {
+            g_analog_input[1].save.collection_type = *page_control->param_addr;
+        }
+        else if (page_control->control_id == 20)
+        {
+            g_analog_input[0].save.unit = *page_control->param_addr;
+        }
+        else if (page_control->control_id == 40)
+        {
+            g_analog_input[1].save.unit = *page_control->param_addr;
+        }
+    }
+}
+//仪器信息
+static void H_F_Infor(void)
+{
+    uint16_t screen_id_temp = PAGE_Infor;
+
+    for (int num = 0; num < 14; num++)
+    {
+        g_hmi.save.num_sensor[num] = (uint8_t) ( g_sensor_o2.data_para.sensor_id[num]);
+    }
+    g_hmi.save.num_sensor[14] = '\0';
+
+    BatchBegin (screen_id_temp);
+    BatchSetText (13, (uint8_t*) g_hmi.save.num_model);     //仪器型号
+    BatchSetText (15, (uint8_t*) &g_hmi.save.num_series);   //整机编号
+    BatchSetText (16, (uint8_t*) &g_hmi.save.num_sensor);   //传感器编号
+    BatchSetText (19, MAINVersion);                         //程序版本号
+    BatchSetTextInt32 (14, (int32_t) g_menu.runtime);        //运行时间
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Infor(void)
+{
+    ;
+}
+
+static void H_O_Infor(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_Infor))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+//仪器信息_带检定
+static void H_F_Infor_certificate(void)
+{
+    uint16_t screen_id_temp = PAGE_Infor_certificate;
+
+    for (int num = 0; num < 14; num++)
+    {
+        g_hmi.save.num_sensor[num] = (uint8_t) ( g_sensor_o2.data_para.sensor_id[num]);
+    }
+    g_hmi.save.num_sensor[14] = '\0';
+
+    BatchBegin (screen_id_temp);
+    BatchSetText (13, (uint8_t*) g_hmi.save.num_model);     //仪器型号
+    BatchSetText (15, (uint8_t*) &g_hmi.save.num_series);   //整机编号
+    BatchSetText (16, (uint8_t*) &g_hmi.save.num_sensor);   //传感器编号
+    BatchSetText (19, MAINVersion);                         //程序版本号
+    BatchSetTextInt32 (14, (int32_t) g_menu.runtime);        //运行时间
+
+    BatchSetText (22, (uint8_t*) &g_life.sensor.save.sensor_adj_user);        //检定员
+    BatchSetText (24, (uint8_t*) &g_life.sensor.save.sensor_adj_date);        //检定日期
+    BatchSetTextInt32 (26, (int) g_life.sensor.save.sensor_adj_cyc);        //有效日期
+
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Infor_certificate(void)
+{
+    ;
+}
+
+static void H_O_Infor_certificate(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_Infor_certificate))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+//数据存储
+static void H_F_DataSave(void)
+{
+    uint16_t screen_id_temp = PAGE_DataSave;
+
+    if(!g_hmi.para.flag_set_time)
+    {
+        g_hmi.para.hmi_set_time.year = g_hmi.para.hmi_time.year;
+        g_hmi.para.hmi_set_time.month = g_hmi.para.hmi_time.month;
+        g_hmi.para.hmi_set_time.date = g_hmi.para.hmi_time.date;
+        g_hmi.para.hmi_set_time.hour = g_hmi.para.hmi_time.hour;
+        g_hmi.para.hmi_set_time.min = g_hmi.para.hmi_time.min;
+        g_hmi.para.hmi_set_time.sec = g_hmi.para.hmi_time.sec;
+    }
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (1, (int32_t) g_save_data_app.save.period_store);
+    BatchSetTextInt32 (2, (int32_t) g_hmi.para.hmi_set_time.year);
+    BatchSetTextInt32 (3, (int32_t) g_hmi.para.hmi_set_time.month);
+    BatchSetTextInt32 (4, (int32_t) g_hmi.para.hmi_set_time.date);
+    BatchSetTextInt32 (5, (int32_t) g_hmi.para.hmi_set_time.hour);
+    BatchSetTextInt32 (27, (int32_t) g_menu.save.usbtime_sec);        //USB存储时间
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+    //表格清除
+    if (datasave_flag == 0)
+        App_history_Data_Current_Dis (0, 0, 0);
+}
+
+static void H_P_DataSave(void)
+{
+    ;
+}
+
+/*
+ * 说明：判断输入的日是否合法
+ * 输入：年月日
+ * 输出：合法返回1 ，违法返回0
+ */
+static uint8_t isValidDay(uint16_t year, uint8_t month, uint8_t day)
+{
+    uint8_t isLeap = 0;
+    uint8_t daysInMonth[] =
+    { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+    isLeap = ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0));
+    if (month == 2)
+    {
+        daysInMonth[1] = isLeap ? 29 : 28;
+    }
+
+    return (day >= 1 && day <= daysInMonth[month - 1]) ? 1 : 0;
+}
+static void H_O_DataSave(PAGE_CONTROL *page_control)
+{
+    uint8_t daysInMonth[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    int temp_val = 0;
+    uint16_t year;
+    uint8_t month;
+
+    uint16_t screen_id_temp = PAGE_DataSave;
+    year = g_hmi.para.hmi_set_time.year + 2000;
+    month = g_hmi.para.hmi_set_time.month;
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_DataSave))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            g_hmi.para.flag_set_time = 0;
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            g_hmi.para.flag_set_time = 0;
+            App_Return_Main_Dis ();
+        }
+        //查询
+        else if (page_control->control_id == 13)
+        {
+
+            App_Menu_Page_Sw (PAGE_DataQuery);        //进入正在查询界面
+        }
+        //3.上一页
+        else if (page_control->control_id == 8)
+        {
+            App_history_Data_Current_Dis (1, 0, 0);
+        }
+        //4.下一页
+        else if (page_control->control_id == 9)
+        {
+            App_history_Data_Current_Dis (2, 0, 0);
+        }
+        else if (page_control->control_id == 29)        //U盘数据导出
+        {
+            if (g_usb_output.USB_link_flash_state == true)        //如果U盘处于连接状态
+            {
+                g_usb_output.usb_export_result = 0;
+                g_usb_export_data.usb_export_flag = 1;
+                menu_waiting = menu_usb_export;
+                App_Menu_Page_Sw (PAGE_Waiting);
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_U_disk_Error);
+            }
+        }
+    }
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == PAGE_DataSave))
+    {
+        int value = 0;
+        //1.存储周期-文本
+        if (page_control->control_id == 1)
+        {
+            sscanf ((const char*) g_page.param_addr, "%2d", &temp_val);
+            g_save_data_app.save.period_store = (uint8_t) temp_val;
+        }
+        //2.年-文本
+        else if (page_control->control_id == 2)
+        {
+            sscanf ((const char*) g_page.param_addr, "%2d", &temp_val);
+            g_hmi.para.hmi_set_time.year = (uint8_t) temp_val;
+        }
+        //3.月-文本
+        else if (page_control->control_id == 3)
+        {
+            sscanf ((const char*) g_page.param_addr, "%2d", &temp_val);
+            g_hmi.para.hmi_set_time.month = (uint8_t) temp_val;
+        }
+        //4.日-文本
+        else if (page_control->control_id == 4)
+        {
+            sscanf ((const char*) g_page.param_addr, "%2d", &temp_val);
+            if (isValidDay (year, month, (uint8_t) temp_val))
+            {
+                g_hmi.para.hmi_set_time.date = (uint8_t) temp_val;
+            }
+            else
+            {
+                if (month == 2)
+                {
+                    if ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))
+                    {
+                        g_hmi.para.hmi_set_time.date = 29;
+                    }
+                    else
+                    {
+                        g_hmi.para.hmi_set_time.date = 28;
+                    }
+                }
+                else
+                {
+                    g_hmi.para.hmi_set_time.date = daysInMonth[month - 1];
+                }
+                BatchBegin (screen_id_temp);
+                BatchSetTextInt32 (4, (int32_t) g_hmi.para.hmi_set_time.date);
+                BatchEnd ();
+            }
+        }
+        //5.时-文本
+        else if (page_control->control_id == 5)
+        {
+            sscanf ((const char*) g_page.param_addr, "%2d", &temp_val);
+            g_hmi.para.hmi_set_time.hour = (uint8_t) temp_val;
+        }
+        else if (page_control->control_id == 27)        //USB存储周期时间设置
+        {
+            sscanf ((const char*) page_control->param_addr, "%d", &value);
+            g_menu.save.usbtime_sec = (uint32_t)value;
+        }
+
+        //6.设置年、月、日和时
+        if (page_control->control_id >= 2)
+            g_hmi.para.flag_set_time = 1;
+    }
+}
+//数据查询等待
+static void H_F_DataQuery(void)
+{
+    uint16_t screen_id_temp = PAGE_DataQuery;
+
+    SetScreen (screen_id_temp);
+    g_save_data_app.para.query_data_flag = 1;        //开始查找
+}
+
+static void H_P_DataQuery(void)
+{
+    if (g_save_data_app.para.query_data_flag == 0)        //查找完成
+    {
+        if (g_save_data_app.para.query_data_res == -1)    //未找到
+            App_Menu_Page_Sw (PAGE_DataNoFound);
+        else
+        {
+            App_history_Data_Current_Dis (0, 1, g_save_data_app.para.query_data_res);   //找到数据并显示
+            App_Menu_Page_Back ();        //返回数据页面
+            datasave_flag = 1;            //不更新数据
+        }
+    }
+}
+
+static void H_O_DataQuery(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_DataQuery))
+    {
+        if (page_control->control_id == 5)
+        {
+            g_save_data_app.para.unquery_flag = 1;        //停止
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//未找到数据
+static void H_F_DataNoFound(void)
+{
+    uint16_t screen_id_temp = PAGE_DataNoFound;
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_DataNoFound(void)
+{
+    ;
+}
+
+static void H_O_DataNoFound(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_DataNoFound))
+    {
+        if (page_control->control_id == 5)
+        {
+            App_Menu_Page_Back_Twice ();
+        }
+    }
+}
+
+/*
+ * 说明：U盘连接错误函数
+ * 输入：无
+ * 输出：无
+ *
+ */
+static void H_F_PAGE_U_disk_Error(void)
+{
+    SetScreen (PAGE_U_disk_Error);
+}
+
+static void H_P_PAGE_U_disk_Error(void)
+{
+    ;
+}
+
+static void H_O_PAGE_U_disk_Error(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_U_disk_Error))
+    {
+        if (page_control->control_id == 3)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//0124菜单
+static void H_F_Menu0124(void)
+{
+    SetScreen (PAGE_Menu0124);
+}
+
+static void H_P_Menu0124(void)
+{
+    ;
+}
+
+static void H_O_Menu0124(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_Menu0124))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 3)
+        {
+            App_Menu_Page_Sw (PAGE_FlowADJ);
+        }
+        else if (page_control->control_id == 4)
+        {
+            App_Menu_Page_Sw (PAGE_Common_Set);
+        }
+        else if (page_control->control_id == 8)
+        {
+            App_Menu_Page_Sw (PAGE_SaveUserSet);
+        }
+        if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Sw (PAGE_Sensor_protect);
+        }
+    }
+}
+
+//流量校准--阀控制
+static void H_F_FlowADJ(void)
+{
+    uint16_t screen_id_temp = PAGE_FlowADJ;
+
+    SetTextValueFloat(screen_id_temp, 15,g_flow.save.flow_span_cal_value / 1000, 1);
+    SetTextValueFloat(screen_id_temp, 9,g_flow.para.flow_curr / 1000, 1);
+    SetTextValueFloat(screen_id_temp, 4,g_pressure.pressure_top ,3);
+    SetTextValueFloat(screen_id_temp, 11,g_pressure.pressure_back ,3);
+    SetTextValueFloat(screen_id_temp, 14,g_flow.save.control_flow / 1000 ,1);
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_FlowADJ(void)
+{
+    uint16_t screen_id_temp = PAGE_FlowADJ;
+    SetTextValueFloat (screen_id_temp, 9, g_flow.para.flow_curr / 1000, 1);
+    SetTextValueFloat(screen_id_temp, 4,g_pressure.pressure_top,3);
+    SetTextValueFloat(screen_id_temp, 11,g_pressure.pressure_back,3);
+}
+
+static void H_O_FlowADJ(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_FlowADJ;
+    float temp_val = 0;
+    int32_t temp_int = 0;
+    float value = 0;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 6 || page_control->control_id == 7)
+        {
+           menu_transmission_value = page_control->control_id;    //确认校准界面判断发送哪个值
+           App_Menu_Page_Sw (PAGE_flowadjEnsure);
+        }
+    }
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 15)
+        {
+            value = (float) atof ((const char*) page_control->param_addr);
+            if (value > 0)
+                value += 0.0001f;    //字符串转float
+            else if (value < 0)
+                value -= 0.0001f;    //字符串转float
+            g_flow.save.flow_span_cal_value = value * 1000;
+        }
+    }
+}
+
+//流量校准确认
+static void H_F_flowadjEnsure(void)
+{
+    uint16_t screen_id_temp = PAGE_flowadjEnsure;
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_flowadjEnsure(void)
+{
+    ;
+}
+
+static void H_O_flowadjEnsure(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_flowadjEnsure;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 3)
+        {
+            if (menu_transmission_value == 6)    //上个界面 零点校准
+            {
+                g_flow.para.flow_cal_ch = 1;
+                App_Menu_Page_Sw (PAGE_Waiting);    //等待
+            }
+            else if (menu_transmission_value == 7)    //上个界面 量程校准
+            {
+                g_flow.para.flow_cal_ch = 2;
+                App_Menu_Page_Sw (PAGE_Waiting);    //等待
+            }
+            menu_waiting = menu_flow_cal;    //在流量标定页面触发等待页面
+        }
+        else if (page_control->control_id == 4)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+//流量标定结果
+static void H_F_FlowADJ_res(void)
+{
+    uint16_t screen_id_temp = PAGE_FlowADJ_res;
+    uint8_t temp_res;
+
+    if (g_flow.para.flow_cal_result == 0)
+        temp_res = 0;
+    else
+        temp_res = 1;
+
+    SetSelectorValue (screen_id_temp, 2, temp_res);
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_FlowADJ_res(void)
+{
+    ;
+}
+
+static void H_O_FlowADJ_res(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_FlowADJ_res))
+    {
+        if (page_control->control_id == 3)
+            App_Menu_Page_Back_Three (); //返回三层  标定结果->等待->确定标定
+    }
+}
+//0124通用设置
+static void H_F_Common_Set(void)
+{
+    uint16_t screen_id_temp = PAGE_Common_Set;
+    uint8_t pre_sw = 0, temp_sw = 0;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (10, *g_var_temp.user_dis.pointer_filter_dis);
+    BatchSetTextInt32 (11, *g_var_temp.user_dis.pointer_filter_out);
+    BatchSetTextInt32 (8, g_pump.save.fan_temperature);
+
+    pre_sw = g_sensor_o2.save.pres_compen_sw;
+    temp_sw =  g_sensor_o2.data_para.temp_comp_sw;
+
+    BatchSetFrame (6, g_life.sensor.save.Verification_switch);
+    BatchSetFrame (1, pre_sw);
+    BatchSetFrame (3, temp_sw);
+    BatchSetFrame (16, g_flow.save.pre_sensor_en);//压力传感器启用
+    BatchSetFrame (23, g_flow.save.valve_control_mode);//智能流量控制
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Common_Set(void)
+{
+    ;
+}
+
+static void H_O_Common_Set(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Common_Set;
+    int value;
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 15)//压力传感器启用
+        {
+            if (g_flow.save.pre_sensor_en == 0)
+                g_flow.save.pre_sensor_en = 1;
+            else
+            {
+                g_flow.save.pre_sensor_en = 0;
+            }
+            AnimationPlayFrame (screen_id_temp, 16, g_flow.save.pre_sensor_en);
+        }
+        else if (page_control->control_id == 22)//智能流量控制
+        {
+            if (g_flow.save.valve_control_mode == 0)
+                g_flow.save.valve_control_mode = 1;
+            else
+            {
+                g_flow.save.valve_control_mode = 0;
+            }
+            AnimationPlayFrame (screen_id_temp, 23 , g_flow.save.valve_control_mode);
+        }
+        else if (page_control->control_id == 5)
+        {
+            if (g_life.sensor.save.Verification_switch == 0)
+                g_life.sensor.save.Verification_switch = 1;
+            else
+            {
+                g_life.sensor.save.Verification_switch = 0;
+            }
+            AnimationPlayFrame (screen_id_temp, 6, g_life.sensor.save.Verification_switch);
+        }
+        //打开压力补偿开关
+        else if (page_control->control_id == 2)
+        {
+            if (g_sensor_o2.save.pres_compen_sw)
+            {
+                g_sensor_o2.save.pres_compen_sw = 0;
+            }
+            else
+            {
+                g_sensor_o2.save.pres_compen_sw = 1;
+            }
+            AnimationPlayFrame (screen_id_temp, 1, g_sensor_o2.save.pres_compen_sw);
+        }
+        //温度
+        else if (page_control->control_id == 4)
+        {
+            if ( g_sensor_o2.data_para.temp_comp_sw)
+            {
+                g_sensor_o2.data_para.temp_comp_sw = 0;
+            }
+            else
+            {
+                g_sensor_o2.data_para.temp_comp_sw  = 1;
+            }
+            AnimationPlayFrame (screen_id_temp, 3, g_sensor_o2.data_para.temp_comp_sw);
+        }
+    }
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        value = (int) atof ((const char*) page_control->param_addr);
+
+        if (page_control->control_id == 11)
+        {
+            *g_var_temp.user_dis.pointer_filter_out = value;
+        }
+        else if (page_control->control_id == 10)
+        {
+            *g_var_temp.user_dis.pointer_filter_dis = value;
+        }
+
+        else if (page_control->control_id == 8)
+        {
+            g_pump.save.fan_temperature = (uint8_t) value;
+        }
+
+    }
+}
+
+//0124-传感器保护
+static void H_F_Sensor_protect(void)
+{
+    uint16_t screen_id_temp = 0;
+
+    screen_id_temp = PAGE_Sensor_protect;    //界面设置值
+    SetSelectorValue (screen_id_temp, 38,g_sensor_o2.save.lock_flag); //解除锁定模式
+    BatchBegin(screen_id_temp);
+    BatchSetTextInt32(1, (int32_t) g_sensor_o2.save.conc_count_time);//浓度保护延时
+    BatchSetTextInt32(53, (int32_t)  g_sensor_o2.save.trend_time);//趋势判断延时
+    BatchSetTextInt32(36, (int32_t) g_sensor_o2.save.lock_time);
+    BatchSetTextDouble(7, (double)g_alarm[2].save.val, g_var_temp.val_digits);//浓度保护上限
+    BatchSetTextDouble(32, (double)g_alarm[3].save.scope_low, 1);//压力保护下限
+    BatchSetTextDouble(29, (double)g_alarm[3].save.scope_upp, 1);//压力保护上限
+    if(g_alarm[2].save.alarm_mode == 0)
+    {
+        BatchSetFrame(87, 0);//浓度保护开关
+    }
+    else
+    {
+        BatchSetFrame(87, 1);//浓度保护开关
+    }
+    if(g_alarm[3].save.alarm_mode == 0)
+    {
+        BatchSetFrame(20, 0);//压力保护开关
+    }
+    else
+    {
+        BatchSetFrame(20, 1);//压力保护开关
+    }
+    BatchSetFrame(48, g_sensor_o2.save.trend_sw);//趋势判断开关
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Sensor_protect(void)
+{
+    uint16_t screen_id_temp = PAGE_Sensor_protect;
+
+    BatchBegin(screen_id_temp);
+    BatchSetTextFloat (9,  (float)g_sensor_o2.data_para.sensor_temp, 2);
+    BatchSetTextFloat (25,  (float)g_pressure.pressure_back, 2);
+    BatchEnd ();
+}
+
+static void H_O_Sensor_protect(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Sensor_protect;
+    double fval_temp = 0;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 12)
+        {
+            if(g_alarm[2].save.alarm_mode == 0)
+            {
+                g_alarm[2].save.alarm_mode = 1;
+            }
+            else
+            {
+                g_alarm[2].save.alarm_mode = 0;
+            }
+            AnimationPlayFrame (screen_id_temp, 87, g_alarm[2].save.alarm_mode);
+        }
+        else if (page_control->control_id == 22)
+        {
+            if(g_alarm[3].save.alarm_mode == 0)
+            {
+                g_alarm[3].save.alarm_mode = 4;
+            }
+            else
+            {
+                g_alarm[3].save.alarm_mode = 0;
+            }
+            AnimationPlayFrame (screen_id_temp, 20, g_alarm[3].save.alarm_mode);
+        }
+        else if (page_control->control_id == 49)
+        {
+            if(g_sensor_o2.save.trend_sw == 0)
+            {
+                g_sensor_o2.save.trend_sw = 1;
+            }
+            else
+            {
+                g_sensor_o2.save.trend_sw = 0;
+            }
+            AnimationPlayFrame (screen_id_temp, 48 , g_sensor_o2.save.trend_sw);
+        }
+    }
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fval_temp = (double) atof ((const char*) page_control->param_addr) + 0.0001f;
+        switch (page_control->control_id)
+        {
+            case 7://浓度保护上限
+            {
+                if (fval_temp >= 10 && fval_temp < 1000000)
+                    g_alarm[2].save.val = fval_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }   break;
+
+            case 1://浓度保护延时
+            {
+                if (fval_temp > 0 && fval_temp <= g_sensor_o2.save.trend_time )
+                    g_sensor_o2.save.conc_count_time = (uint16_t) fval_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            }break;
+
+            case 36:
+            {
+                if (fval_temp > 0)
+                    g_sensor_o2.save.lock_time = (uint16_t) fval_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            } break;
+
+            case 32://压力保护下限
+            {
+                if (fval_temp < g_alarm[3].save.scope_upp)
+                    g_alarm[3].save.scope_low = (float) fval_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            } break;
+
+            case 29://压力保护上限
+            {
+                if (fval_temp > g_alarm[3].save.scope_low)
+                    g_alarm[3].save.scope_upp = (float) fval_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            } break;
+
+            case 53://趋势判断延时
+            {
+                if (fval_temp > g_sensor_o2.save.conc_count_time)
+                    g_sensor_o2.save.trend_time = (uint16_t) fval_temp;
+                else
+                    App_Menu_Page_Sw (PAGE_Set_Error);
+            } break;
+
+            default:
+            break;
+        }
+       // H_F_0303_DoubleO2_Sensor_Para ();
+    }
+    //B.菜单
+    if((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 27)
+        {
+            g_sensor_o2.save.lock_flag = *page_control->param_addr;
+            SetSelectorValue (screen_id_temp, 38,g_sensor_o2.save.lock_flag);
+        }
+    }
+}
+//保存用户
+static void H_F_SaveUserSet(void)
+{
+    uint16_t screen_id_temp = 0;
+
+    screen_id_temp = PAGE_SaveUserSet; //界面设置值
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_SaveUserSet(void)
+{
+    ;
+}
+
+static void H_O_SaveUserSet(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = 0;
+
+    screen_id_temp = PAGE_SaveUserSet; //界面设置
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 1)
+        {
+            g_flash_var.com_save_flag = data_handle_all_user_save;
+            App_Menu_Page_Sw (PAGE_SaveRes);
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+
+DoubleO2_Ctrl temp_doubleo2_ctrl;
+//双氧0918标定
+static void H_F_Menu0918_DoubleO2(void)
+{
+    uint16_t screen_id_temp = 0;
+    uint8_t digits = 2;
+    screen_id_temp = PAGE_Menu0918_DoubleO2;    //界面设置值
+
+    VAL_UNIT temp;
+    digits = (uint8_t)g_var_temp.val_digits;
+    temp.screen_id = screen_id_temp;
+    temp.ctrl_id_val = 18;
+    temp.ctrl_id_unit = 15;
+    temp.sig = (double)g_sensor_o2.data_para.val_sig;
+    App_Sig_Dis (&temp);
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (19, (double)*g_var_temp.sensor.pointer_user_dis_tent, digits);
+    BatchSetTextDouble (3, (double) g_sensor_o2.data_para.cal_zero_value, digits);
+    BatchSetTextDouble (5, (double) g_sensor_o2.data_para.cal_span1_value, digits);
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+static void H_P_Menu0918_DoubleO2(void)
+{
+    uint16_t screen_id_temp;
+    uint8_t digits = 2;
+    screen_id_temp = PAGE_Menu0918_DoubleO2;     //界面设置值
+
+    VAL_UNIT temp;
+    digits = (uint8_t)g_var_temp.val_digits;
+    temp.screen_id = screen_id_temp;
+    temp.ctrl_id_val = 18;
+    temp.ctrl_id_unit = 15;
+    temp.sig = (double) g_sensor_o2.data_para.val_sig;
+    App_Sig_Dis (&temp);
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (19, (double)*g_var_temp.sensor.pointer_user_dis_tent, digits);
+    BatchEnd ();
+
+}
+
+static void H_O_Menu0918_DoubleO2(PAGE_CONTROL *page_control)
+{
+    double fvalue;
+    uint16_t screen_id_temp = PAGE_Menu0918_DoubleO2;
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fvalue = (double) atof ((const char*) page_control->param_addr);
+        if (fvalue > 0)
+            fvalue += 0.0001f;    //字符串转float
+        else if (fvalue < 0)
+            fvalue -= 0.0001f;    //字符串转float
+
+
+        if (page_control->control_id == 3)
+        {
+            if(fvalue >= g_sensor_o2.data_para.cal_span1_value || fvalue < 0 || fvalue > 999999.9999)
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            else
+            {
+                g_sensor_o2.data_para.cal_zero_value = fvalue;
+                BatchBegin (screen_id_temp);
+                BatchSetTextDouble (3, (double) g_sensor_o2.data_para.cal_zero_value, g_var_temp.val_digits);
+                BatchEnd ();
+            }
+        }
+        else if (page_control->control_id == 5)
+        {
+            if(fvalue <= g_sensor_o2.data_para.cal_zero_value || fvalue < 0 || fvalue > 999999.9999)
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            else
+            {
+                g_sensor_o2.data_para.cal_span1_value = fvalue;
+                BatchBegin (screen_id_temp);
+                BatchSetTextDouble (5, (double) g_sensor_o2.data_para.cal_span1_value, g_var_temp.val_digits);
+                BatchEnd ();
+            }
+        }
+    }
+
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        //1.O2零点标定
+        if (page_control->control_id == 6)
+        {
+            g_sensor_o2.data_para.menu_cal_point = 1;
+            App_Menu_Page_Sw (PAGE_CalEnsure_DoubleO2);
+        }
+        //2.O2量程点标定
+        else if (page_control->control_id == 7)
+        {
+            g_sensor_o2.data_para.menu_cal_point = 2;
+            App_Menu_Page_Sw (PAGE_CalEnsure_DoubleO2);
+        }
+        else if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+//确认执行标定界面
+static void H_F_CalEnsure_DoubleO2(void)
+{
+    uint8_t screen_id_temp = PAGE_CalEnsure_DoubleO2;
+
+    SetSelectorValue (screen_id_temp, 2, 0);
+    SetScreen (PAGE_CalEnsure_DoubleO2);
+}
+
+static void H_P_CalEnsure_DoubleO2(void)
+{
+    ;
+}
+
+static void H_O_CalEnsure_DoubleO2(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_CalEnsure_DoubleO2;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 3)
+        {
+            ///ZERO CAL
+            if (g_sensor_o2.data_para.menu_cal_point == 1)
+            {
+                g_sensor_o2.cal_para.flag_ch = 1;
+            }
+            ///SPAN1 CAL
+            else if (g_sensor_o2.data_para.menu_cal_point == 2)
+            {
+                g_sensor_o2.cal_para.flag_ch = 2;
+            }
+            menu_waiting = menu_cal_micro;
+            App_Menu_Page_Sw (PAGE_Waiting);
+        }
+        else if (page_control->control_id == 4)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//标定结果界面
+static void H_F_CalRes_DoubleO2(void)
+{
+    uint16_t screen_temp = PAGE_CalRes_DoubleO2;
+    if (temp_doubleo2_ctrl.res_set == 0)
+    {
+        SetSelectorValue (screen_temp, 2, 0);
+    }
+    else
+    {
+        SetSelectorValue (screen_temp, 2, 1);
+    }
+    SetScreen (screen_temp);
+}
+
+static void H_P_CalRes_DoubleO2(void)
+{
+    ;
+}
+
+static void H_O_CalRes_DoubleO2(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_temp = PAGE_CalRes_DoubleO2;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_temp))
+    {
+        if (page_control->control_id == 3)
+        {
+            App_Menu_Page_Back_Three ();
+        }
+    }
+}
+
+//微常氧传感器-0330标定参数菜单
+static void H_F_0330_DoubleO2_Cal_Para(void)
+{
+    uint16_t screen_id_temp = PAGE_Menu0330_DoubleO2_Cal_Para;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextFloat (27, (float) g_sensor_o2.data_para.K, 3);
+    BatchSetTextFloat (32, (float) g_sensor_o2.data_para.C, 3);
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_0330_DoubleO2_Cal_Para(void)
+{
+  ;
+}
+
+static void H_O_0330_DoubleO2_Cal_Para(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Menu0330_DoubleO2_Cal_Para;
+    double fvalue = 0;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 501)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == 500)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+    //B.文本事件
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fvalue = (double) atof ((const char*) page_control->param_addr);
+        if (fvalue > 0)
+            fvalue += 0.0001f;
+        else if (fvalue < 0)
+            fvalue -= 0.0001f;
+
+        if (page_control->control_id == 27)
+        {
+            g_sensor_o2.data_para.K = (float)fvalue;
+            g_sensor_o2.data_para.write_sensor_message = cail_K;
+        }
+        else if (page_control->control_id == 32)
+        {
+            g_sensor_o2.data_para.C = (float)fvalue;
+            g_sensor_o2.data_para.write_sensor_message = cail_C;
+        }
+    }
+}
+
+//1028菜单
+static void H_F_Menu1028Page(void)
+{
+    uint16_t screen_id_temp = PAGE_Menu1028Page;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (9, (double) (*g_var_temp.user_dis.pointer_upp) ,g_var_temp.val_digits);
+    BatchSetTextDouble (10, (double) (*g_var_temp.user_dis.pointer_low) ,g_var_temp.val_digits);
+    BatchSetTextDouble (8, (double) (*g_var_temp.user_dis.pointer_const) , g_var_temp.val_digits);
+    BatchSetTextDouble (14, (double) (*g_var_temp.user_dis.pointer_amend) , g_var_temp.val_digits);
+    BatchEnd ();
+    AnimationPlayFrame (screen_id_temp, 1, (*g_var_temp.user_dis.pointer_const_sw));
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Menu1028Page(void)
+{
+    ;
+}
+
+static void H_O_Menu1028Page(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Menu1028Page;
+    double fvalue = 0;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 7)
+        {
+            if ((*g_var_temp.user_dis.pointer_const_sw) == 0)
+                (*g_var_temp.user_dis.pointer_const_sw) = 1;
+            else
+                (*g_var_temp.user_dis.pointer_const_sw) = 0;
+            AnimationPlayFrame (screen_id_temp, 1, (*g_var_temp.user_dis.pointer_const_sw));
+        }
+        else if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fvalue = (double) atof ((const char*) page_control->param_addr);
+        if(fvalue > 0)
+            fvalue += 0.000001f;    //字符串转float
+        else if (fvalue < 0)
+            fvalue -= 0.000001f;    //字符串转float
+
+        if ((*g_var_temp.sensor.pointer_unit_val) == unit_percent)
+            fvalue *= beishu_unit;
+
+        if (page_control->control_id == 9)
+        {
+            if (fvalue > (*g_var_temp.user_dis.pointer_low) && fvalue <= g_var_temp.val_limit_upp && fvalue >= 0 && fvalue < 1000000)
+                (*g_var_temp.user_dis.pointer_upp) =  fvalue;
+            else
+                App_Menu_Page_Sw (PAGE_Set_Error);
+        }
+        else if (page_control->control_id == 10)
+        {
+            if (fvalue < (*g_var_temp.user_dis.pointer_upp) && fvalue >= g_var_temp.val_limit_low && fvalue >= 0 && fvalue < 1000000)
+                (*g_var_temp.user_dis.pointer_low) =  fvalue;
+            else
+                App_Menu_Page_Sw (PAGE_Set_Error);
+        }
+        else if (page_control->control_id == 8)
+        {
+            if(fvalue >= 0 && fvalue < 1000000)
+            {
+                (*g_var_temp.user_dis.pointer_const) =  fvalue;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+        else if (page_control->control_id == 14)
+        {
+            if(fvalue > -1000000 && fvalue < 1000000)
+            {
+                (*g_var_temp.user_dis.pointer_amend) =  fvalue;
+            }
+            else
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+        }
+
+       // H_F_Menu1028Page ();
+    }
+}
+
+//数据恢复
+static void H_F_DataRecovery(void)
+{
+    uint16_t screen_id_temp = PAGE_DataRecovery;
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_DataRecovery(void)
+{
+    ;
+}
+
+static void H_O_DataRecovery(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_DataRecovery))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 1)
+        {
+            App_Menu_Page_Sw (PAGE_RecoverUser);
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Sw (PAGE_RecoverFac);
+        }
+    }
+}
+
+//恢复工厂
+static void H_F_RecoverFac(void)
+{
+    uint16_t screen_id_temp = PAGE_RecoverFac;
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_RecoverFac(void)
+{
+    ;
+}
+
+static void H_O_RecoverFac(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_RecoverFac))
+    {
+        if (page_control->control_id == 1)
+        {
+            g_flash_var.com_save_flag = data_handle_all_fac_recover;
+            menu_waiting = menu_ref_set;        //等待
+            App_Menu_Page_Sw (PAGE_Waiting);
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//恢复用户
+static void H_F_RecoverUser(void)
+{
+    uint16_t screen_id_temp = PAGE_RecoverUser;
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_RecoverUser(void)
+{
+    ;
+}
+
+static void H_O_RecoverUser(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_RecoverUser))
+    {
+        if (page_control->control_id == 1)
+        {
+            g_flash_var.com_save_flag = data_handle_all_user_recover;
+            menu_waiting = menu_ref_set;    //等待
+            App_Menu_Page_Sw (PAGE_Waiting);
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//数据恢复结果
+static void H_F_RecoverResult(void)
+{
+    uint16_t screen_id_temp = PAGE_RecoverResult;
+
+    SetScreen (screen_id_temp);
+}
+static void H_P_RecoverResult(void)
+{
+    ;
+}
+
+static void H_O_RecoverResult(PAGE_CONTROL *page_control)
+{
+    //1.若点击确定按钮后(数据恢复界面->恢复工厂界面->数据恢复界面)
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_RecoverResult))
+    {
+        if (page_control->control_id == 1)
+        {
+            App_Menu_Page_Back_Three ();
+        }
+    }
+}
+
+//授权设置界面
+static void H_F_Authority_Set_Page(void)
+{
+    uint16_t screen_id_temp = PAGE_Authority_Set;
+
+    AnimationPlayFrame (screen_id_temp, 14, g_life.main.save.main_password_lock_switch); //密码保护
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (1, g_life.main.save.limit_class[0].limit_time);       //运行时间
+    BatchSetTextInt32 (2, g_life.main.save.limit_class[1].limit_time);       //运行时间
+    BatchSetTextInt32 (3, g_life.main.save.limit_class[2].limit_time);       //运行时间
+    BatchSetTextInt32 (4, g_life.main.save.limit_class[3].limit_time);       //运行时间
+    BatchEnd ();
+
+    BatchBegin (screen_id_temp);
+    BatchSetText (50, (uint8_t*) g_life.main.save.phone_num);                        //电话
+    BatchSetText (5, (uint8_t*) g_life.main.save.limit_class[0].limit_password);    //密码1
+    BatchSetText (6, (uint8_t*) g_life.main.save.limit_class[1].limit_password);   //密码2
+    BatchSetText (7, (uint8_t*) g_life.main.save.limit_class[2].limit_password);   //密码2
+    BatchSetText (8, (uint8_t*) g_life.main.save.limit_class[3].limit_password);   //密码2
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Authority_Set_Page(void)
+{
+    ;
+}
+
+static void H_O_Authority_Set_Page(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Authority_Set;
+    int value, i = 0;
+    uint16_t Len = 0;
+    char data[21] ={ 0 };
+    uint8_t *p = page_control->param_addr;
+
+    sscanf ((const char*) page_control->param_addr, "%d", &value);
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 1)
+        {
+            g_life.main.save.limit_class[0].limit_time = (uint16_t) value;
+        }
+        else if (page_control->control_id == 2)
+        {
+            g_life.main.save.limit_class[1].limit_time = (uint16_t) value;
+        }
+        else if (page_control->control_id == 3)
+        {
+            g_life.main.save.limit_class[2].limit_time = (uint16_t) value;
+        }
+        else if (page_control->control_id == 4)
+        {
+            g_life.main.save.limit_class[3].limit_time = (uint16_t) value;
+        }
+        else if (page_control->control_id >= 50)
+        {
+            Len = (uint16_t) GetStringLen (page_control->param_addr);
+            for (i = 0; i < Len; i++)
+            {
+                data[i] = (char) *p;
+                p++;
+            }
+            if (21 - Len > 0)
+            {
+                for (; i < 21; i++)
+                    data[i] = 0;
+            }
+            for (i = 0; i < 21; i++)
+            {
+                g_life.main.save.phone_num[i] = (uint8_t) data[i];
+            }
+        }
+        else if (page_control->control_id >= 5 && page_control->control_id <= 8)
+        {
+            Len = (uint16_t) GetStringLen (page_control->param_addr);
+            for (i = 0; i < Len; i++)
+            {
+                data[i] = (char) *p;
+                p++;
+            }
+            if (11 - Len > 0)
+            {
+                for (; i < 21; i++)
+                    data[i] = 0;
+            }
+            if(data[0] == 0)//防止输入为空
+            {
+                H_F_Authority_Set_Page();
+            }
+            else
+            {
+                for (i = 0; i < 11; i++)
+                {
+                    g_life.main.save.limit_class[page_control->control_id - 5].limit_password[i] = (uint8_t) data[i];
+                }
+            }
+
+        }
+    }
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 10)
+        {
+            if (g_life.main.save.main_password_lock_switch)
+            {
+                g_life.main.save.main_password_lock_switch = 0;
+                g_life.main.save.now_limit_time_quantum = 0;
+                g_life.main.para.limit_4times_over_flag = 0;
+            }
+            else
+            {
+                g_life.main.save.main_password_lock_switch = 1;
+            }
+            AnimationPlayFrame (screen_id_temp, 14, g_life.main.save.main_password_lock_switch);
+        }
+    }
+}
+
+//用户锁定界面
+static void H_F_Trial_Hint_Page(void)
+{
+    uint16_t screen_id_temp = PAGE_Trial_Hint;
+
+    BatchBegin (screen_id_temp);
+    BatchSetText (13, (uint8_t*) g_hmi.save.num_model);     //仪器型号
+    BatchSetText (15, (uint8_t*) &g_hmi.save.num_series);   //整机编号
+    BatchSetText (16, (uint8_t*) &g_life.main.save.phone_num);   //电话
+    BatchSetTextInt32 (14, (int32_t) g_menu.runtime);        //运行时间
+    BatchEnd ();
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Trial_Hint_Page(void)
+{
+    ;
+}
+
+static void H_O_Trial_Hint_Page(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Trial_Hint;
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)        //进入密码输入界面
+        {
+            App_Menu_Page_Sw (PAGE_TrialPasswordInput);
+        }
+    }
+}
+
+//使用密码输入界面
+static void H_F_TrialPasswordInput(void)
+{
+    uint16_t screen_id_temp = PAGE_TrialPasswordInput;
+    char str_temp[] ={ "0000000000" };
+
+    SetTextValue (screen_id_temp, 1, (uint8_t*) str_temp);
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (5, (int) g_life.main.save.now_limit_time_quantum);
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_TrialPasswordInput(void)
+{
+    ;
+}
+
+static void H_O_TrialPasswordInput(PAGE_CONTROL *page_control)
+{
+   // int id_screen_temp = 0;
+    uint8_t i;
+    uint16_t Len = 0;
+    char data[14] ={ 0 };
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_TrialPasswordInput))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        //2.去页面登录
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Menu_Page_Sw (PAGE_UserLogin);
+        }
+    }
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == PAGE_TrialPasswordInput))
+    {
+        Len = (uint16_t) GetStringLen (page_control->param_addr);
+        for (i = 0; i < Len; i++)
+        {
+            data[i] = (char) *page_control->param_addr;
+            page_control->param_addr++;
+        }
+        if (11 - Len > 0)
+        {
+            for (; i < 10; i++)
+                data[i] = 0;
+        }
+        if (main_password_after_input_judge ((uint8_t*) data))    //比较密码
+        {
+           // id_screen_temp = PAGE_PasswordErr;
+            App_Menu_Page_Sw (PAGE_PasswordErr);
+        }
+        else
+        {
+            g_flash_var.save_flag.Bits.write_time = 1;
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//密码错误界面
+static void H_F_PasswordErr(void)
+{
+    SetScreen (PAGE_PasswordErr);
+}
+
+static void H_P_PasswordErr(void)
+{
+    ;
+}
+
+static void H_O_PasswordErr(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_PasswordErr))
+    {
+        if (page_control->control_id == 3)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//0204标定记录
+static void H_F_Menu0204(void)
+{
+    App_At24c256_Data_Cal_Dis (0);
+    SetScreen (PAGE_Menu0204);
+}
+
+static void H_P_Menu0204(void)
+{
+    ;
+}
+
+static void H_O_Menu0204(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Menu0204;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+        else if (page_control->control_id == 5)
+        {
+            App_At24c256_Data_Cal_Dis (1);
+        }
+        else if (page_control->control_id == 6)
+        {
+            App_At24c256_Data_Cal_Dis (2);
+        }
+    }
+}
+
+//MENU0303菜单
+static void H_F_Menu0303(void)
+{
+    SetScreen (PAGE_Menu0303);
+}
+
+static void H_P_Menu0303(void)
+{
+    ;
+}
+
+static void H_O_Menu0303(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Menu0303;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 50)
+        {
+            App_Menu_Page_Sw (PAGE_Menu0303_DoubleO2_Sensor_Set);
+        }
+        else if (page_control->control_id == 51)
+        {
+            App_Menu_Page_Sw (PAGE_Analysis_inf);
+        }
+        else if (page_control->control_id == 57)
+        {
+            App_Menu_Page_Sw (PAGE_SaveFacEnsure);
+        }
+        else if (page_control->control_id == 52)
+        {
+            App_Menu_Page_Sw (PAGE_FlowControl);
+        }
+        else if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+//微常氧传感器-0303传感器菜单
+static void H_F_0303_DoubleO2_Sensor_Set(void)
+{
+    SetScreen (PAGE_Menu0303_DoubleO2_Sensor_Set);
+}
+
+static void H_P_0303_DoubleO2_Sensor_Set(void)
+{
+    ;
+}
+
+static void H_O_0303_DoubleO2_Sensor_Set(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Menu0303_DoubleO2_Sensor_Set;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 53)
+        {
+            App_Menu_Page_Sw (PAGE_Menu0303_DoubleO2_Sensor_Info);    //传感器信息设置
+        }
+        else if (page_control->control_id == 54)
+        {
+            App_Menu_Page_Sw (PAGE_LdSensor_infoSet);    //传感器维护设置
+        }
+        else if (page_control->control_id == 55)
+        {
+            App_Menu_Page_Sw (PAGE_Menu0303_Err);    //错误记录
+        }
+
+        else if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+////微常氧传感器-0303传感器工作设置菜单
+//static void H_F_0303_DoubleO2_Sensor_Work(void)
+//{
+//    uint16_t screen_id_temp = PAGE_Menu0303_DoubleO2_Sensor_Work;
+//
+//    SetSelectorValue (screen_id_temp, 38,g_sensor_o2.save.lock_flag);
+//    SetScreen (screen_id_temp);
+//
+//    BatchBegin(screen_id_temp);
+//    BatchSetTextInt32(1, (int32_t) g_sensor_o2.save.conc_count_time);//浓度保护延时
+//    BatchSetTextInt32(53, (int32_t)  g_sensor_o2.save.trend_time);//趋势判断延时
+//    BatchSetTextInt32(36, (int32_t) g_sensor_o2.save.lock_time);
+//    BatchSetTextDouble(7, (double)g_alarm[2].save.val, g_var_temp.val_digits);//浓度保护上限
+//    BatchSetTextDouble(32, (double)g_alarm[3].save.scope_low, 1);//压力保护下限
+//    BatchSetTextDouble(29, (double)g_alarm[3].save.scope_upp, 1);//压力保护上限
+//    BatchSetTextFloat (9,  (float)  g_sensor_o2.data_para.sensor_temp, 2);
+//    if(g_alarm[2].save.alarm_mode == 0)
+//    {
+//        BatchSetFrame(87, 0);//浓度保护开关
+//    }
+//    else
+//    {
+//        BatchSetFrame(87, 1);//浓度保护开关
+//    }
+//    if(g_alarm[3].save.alarm_mode == 0)
+//    {
+//
+//        BatchSetFrame(20, 0);//压力保护开关
+//    }
+//    else
+//    {
+//
+//        BatchSetFrame(20, 1);//压力保护开关
+//    }
+//    BatchSetFrame(48, g_sensor_o2.save.trend_sw);//趋势判断开关
+//    BatchEnd ();
+//}
+//
+//static void H_P_0303_DoubleO2_Sensor_Work(void)
+//{
+//    uint16_t screen_id_temp = PAGE_Menu0303_DoubleO2_Sensor_Work;
+//
+//    BatchBegin(screen_id_temp);
+//    BatchSetTextFloat (9,  (float)g_sensor_o2.data_para.sensor_temp, 2);
+//    BatchSetTextFloat (25,  (float)g_pressure.pressure_back, 2);
+//    BatchEnd ();
+//}
+//
+//static void H_O_0303_DoubleO2_Sensor_Work(PAGE_CONTROL *page_control)
+//{
+//    uint16_t screen_id_temp = PAGE_Menu0303_DoubleO2_Sensor_Work;
+//    double fval_temp = 0;
+//
+//    //1.每次点击按键值，值增加；若大于上限设置值，则等于上限值；
+//    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+//    {
+//        if (page_control->control_id == BUTTON_RETURN)    //返回上一级菜单
+//        {
+//            App_Menu_Page_Back ();
+//        }
+//        else if (page_control->control_id == BUTTON_MAIN)    //返回主界面
+//        {
+//            App_Return_Main_Dis ();
+//        }
+//        else if (page_control->control_id == 12)
+//        {
+//            if(g_alarm[2].save.alarm_mode == 0)
+//            {
+//                g_alarm[2].save.alarm_mode = 1;
+//            }
+//            else
+//            {
+//                g_alarm[2].save.alarm_mode = 0;
+//            }
+//        }
+//        else if (page_control->control_id == 22)
+//        {
+//            if(g_alarm[3].save.alarm_mode == 0)
+//            {
+//                g_alarm[3].save.alarm_mode = 4;
+//            }
+//            else
+//            {
+//                g_alarm[3].save.alarm_mode = 0;
+//            }
+//        }
+//        else if (page_control->control_id == 49)
+//        {
+//            if(g_sensor_o2.save.trend_sw == 0)
+//            {
+//                g_sensor_o2.save.trend_sw = 1;
+//            }
+//            else
+//            {
+//                g_sensor_o2.save.trend_sw = 0;
+//            }
+//        }
+//        H_F_0303_DoubleO2_Sensor_Work();
+//    }
+//    if ((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+//    {
+//        if (page_control->control_id == 27)
+//        {
+//            g_sensor_o2.save.lock_flag = *page_control->param_addr;
+//        }
+//        SetSelectorValue (screen_id_temp, 38,g_sensor_o2.save.lock_flag);
+//    }
+//    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+//    {
+//        fval_temp = (double) atof ((const char*) page_control->param_addr) + 0.0001f;
+//        switch (page_control->control_id)
+//        {
+//            case 7://浓度保护上限
+//            {
+//                if (fval_temp >= 10  && fval_temp < 1000000)
+//                    g_alarm[2].save.val = fval_temp;
+//                else
+//                    App_Menu_Page_Sw (PAGE_Set_Error);
+//            }   break;
+//
+//            case 1://浓度保护延时
+//            {
+//                if (fval_temp > 0 && fval_temp <= g_sensor_o2.save.trend_time )
+//                    g_sensor_o2.save.conc_count_time = (uint16_t) fval_temp;
+//                else
+//                    App_Menu_Page_Sw (PAGE_Set_Error);
+//            }break;
+//
+//            case 36:
+//            {
+//                if (fval_temp > 0)
+//                    g_sensor_o2.save.lock_time = (uint16_t) fval_temp;
+//                else
+//                    App_Menu_Page_Sw (PAGE_Set_Error);
+//            } break;
+//
+//            case 32://压力保护下限
+//            {
+//                if (fval_temp < g_alarm[3].save.scope_upp)
+//                    g_alarm[3].save.scope_low = (float) fval_temp;
+//                else
+//                    App_Menu_Page_Sw (PAGE_Set_Error);
+//            } break;
+//
+//            case 29://压力保护上限
+//            {
+//                if (fval_temp > g_alarm[3].save.scope_low)
+//                    g_alarm[3].save.scope_upp = (float) fval_temp;
+//                else
+//                    App_Menu_Page_Sw (PAGE_Set_Error);
+//            } break;
+//
+//            case 53://趋势判断延时
+//            {
+//                if (fval_temp > g_sensor_o2.save.conc_count_time)
+//                    g_sensor_o2.save.trend_time = (uint16_t) fval_temp;
+//                else
+//                    App_Menu_Page_Sw (PAGE_Set_Error);
+//            } break;
+//
+//            default:
+//            break;
+//        }
+//       H_F_0303_DoubleO2_Sensor_Work ();
+//    }
+//}
+
+
+//微常氧传感器-0303传感器参数设置菜单
+static void H_F_0303_DoubleO2_Sensor_Info(void)
+{
+    uint16_t screen_id_temp = PAGE_Menu0303_DoubleO2_Sensor_Info;
+    uint8_t micro_num_temp[15] ={0};
+    uint8_t micro_version_temp[33] ={0};
+    uint8_t digits = 2;
+    VAL_UNIT temp;
+
+    //信号
+    temp.screen_id = screen_id_temp;
+    temp.ctrl_id_val = 7;
+    temp.ctrl_id_unit = 10;
+    temp.sig = (double) g_sensor_o2.data_para.val_sig;
+    App_Sig_Dis (&temp);
+
+    SetSelectorValue (screen_id_temp, 14, g_sensor_o2.data_para.val_1_sta);
+    //实时浓度+零点标定浓度+量程点标定浓度+K/C值
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (6, (float) g_sensor_o2.data_para.val_user_dis, g_var_temp.val_digits);     //微量氧浓度
+    BatchSetTextDouble (66, (float) g_sensor_o2.data_para.sensor_temp, digits);    //传感器温度值
+    BatchEnd ();
+
+    //微氧编号
+    for (int num = 0; num < 14; num++)
+    {
+        micro_num_temp[num ] = (uint8_t) ( g_sensor_o2.data_para.sensor_id[num]);
+    }
+    micro_num_temp[14] = '\0';
+    for(uint8_t i = 0 ; i < 32 ; i++)
+    {
+        micro_version_temp[i] = g_sensor_o2.data_para.sensor_version[i];
+    }
+    micro_version_temp[33] = '\0';
+
+    BatchBegin (screen_id_temp);
+    BatchSetText (600, (uint8_t*) &micro_num_temp);
+    BatchEnd ();
+
+    //2.传感器模块程序版本号、传感器程序版本号
+    BatchBegin (screen_id_temp);
+    BatchSetText (601, (uint8_t*)&micro_version_temp);
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_0303_DoubleO2_Sensor_Info(void)
+{
+    uint8_t digits = 2;
+    uint16_t screen_id_temp = 0;
+    VAL_UNIT temp;
+
+    screen_id_temp = PAGE_Menu0303_DoubleO2_Sensor_Info;    //界面设置值
+    //信号
+    temp.screen_id = screen_id_temp;
+    temp.ctrl_id_val = 7;
+    temp.ctrl_id_unit = 10;
+    temp.sig = (double) g_sensor_o2.data_para.val_sig;
+    App_Sig_Dis (&temp);
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextDouble (6, (float) g_sensor_o2.data_para.val_user_dis, g_var_temp.val_digits);     //微量氧浓度
+    BatchSetTextDouble (67, (float) g_sensor_o2.data_para.sensor_temp, digits);    //传感器温度值
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_O_0303_DoubleO2_Sensor_Info(PAGE_CONTROL *page_control)
+{
+    int value, i = 0;
+    uint16_t Len = 0;
+    char data[16] = { 0 };
+    uint8_t *p = page_control->param_addr;
+    uint16_t screen_id_temp = PAGE_Menu0303_DoubleO2_Sensor_Info;
+
+    sscanf ((const char*) page_control->param_addr, "%d", &value);
+    Len = (uint16_t) GetStringLen (page_control->param_addr);
+    for (i = 0; i < Len; i++)
+    {
+        data[i] = (char) *p;
+        p++;
+    }
+    if (16 - Len > 0)
+    {
+        for (; i < 16; i++)
+            data[i] = 0;
+    }
+
+    //A.文本事件
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+       if (page_control->control_id == 600)
+        {
+           if(data[0] == 0)
+           {
+               H_F_0303_DoubleO2_Sensor_Info();
+           }
+           else
+           {
+               for (i = 0; i < 14; i++)
+               {
+                   g_sensor_o2.data_para.sensor_id[i] = (uint8_t)data[i];
+               }
+               g_sensor_o2.data_para.write_sensor_message = Sensorser_Num;
+           }
+        }
+    }
+    //B.按键
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+//错误记录菜单
+static void H_F_Menu0303_Err(void)
+{
+    SetScreen (PAGE_Menu0303_Err);
+}
+
+static void H_P_Menu0303_Err(void)
+{
+    ;
+}
+
+static void H_O_Menu0303_Err(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Menu0303_Err;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 53)
+        {
+            App_Menu_Page_Sw (PAGE_Menu0303_ErrConc);
+        }
+        else if (page_control->control_id == 54)
+        {
+            App_Menu_Page_Sw (PAGE_Menu0303_ErrTemp);
+        }
+        else if (page_control->control_id == 55)
+        {
+            App_Menu_Page_Sw (PAGE_Menu0303_ErrPre);
+        }
+        else if (page_control->control_id == 56)
+        {
+            App_Menu_Page_Sw (PAGE_Menu0303_ErrSet);
+        }
+        else if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+    }
+}
+
+
+//浓度错误记录
+static void H_F_Menu0303_ErrConc(void)
+{
+    App_At24c256_DataDis_ErrRecord_Conc(0);
+    SetScreen(PAGE_Menu0303_ErrConc);
+}
+
+static void H_P_Menu0303_ErrConc(void)
+{
+    ;
+}
+
+static void H_O_Menu0303_ErrConc(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp= PAGE_Menu0303_ErrConc;
+
+    if((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis();
+        }
+        else if(page_control->control_id == 5)
+        {
+            App_At24c256_DataDis_ErrRecord_Conc(1);
+        }
+        else if(page_control->control_id == 6)
+        {
+            App_At24c256_DataDis_ErrRecord_Conc(2);
+        }
+    }
+}
+
+//压力错误记录
+static void H_F_Menu0303_ErrPre(void)
+{
+    App_At24c256_DataDis_ErrRecord_Pre(0);
+    SetScreen(PAGE_Menu0303_ErrPre);
+}
+
+static void H_P_Menu0303_ErrPre(void)
+{
+    ;
+}
+
+static void H_O_Menu0303_ErrPre(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp= PAGE_Menu0303_ErrPre;
+
+    if((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis();
+        }
+        else if(page_control->control_id == 5)
+        {
+            App_At24c256_DataDis_ErrRecord_Pre(1);
+        }
+        else if(page_control->control_id == 6)
+        {
+            App_At24c256_DataDis_ErrRecord_Pre(2);
+        }
+    }
+}
+
+//温度错误记录
+static void H_F_Menu0303_ErrTemp(void)
+{
+    App_At24c256_DataDis_ErrRecord_Temp(0);
+    SetScreen(PAGE_Menu0303_ErrTemp);
+}
+
+static void H_P_Menu0303_ErrTemp(void)
+{
+    ;
+}
+
+static void H_O_Menu0303_ErrTemp(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp= PAGE_Menu0303_ErrTemp;
+
+    if((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis();
+        }
+        else if(page_control->control_id == 5)
+        {
+            App_At24c256_DataDis_ErrRecord_Temp(1);
+        }
+        else if(page_control->control_id == 6)
+        {
+            App_At24c256_DataDis_ErrRecord_Temp(2);
+        }
+    }
+}
+
+//记录设置
+static void H_F_Menu0303_ErrSet(void)
+{
+    uint16_t screen_id_temp = 0;
+
+    screen_id_temp = PAGE_Menu0303_ErrSet;
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (55,(int)g_sensor_o2.save.user_dis.err_temp_low);   //错误记录温度
+    BatchSetTextInt32 (28,(int)g_sensor_o2.save.user_dis.err_temp_up);   //错误记录温度
+    BatchEnd ();
+
+    SetScreen(screen_id_temp);
+}
+
+static void H_P_Menu0303_ErrSet(void)
+{
+    ;
+}
+
+static void H_O_Menu0303_ErrSet(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp= PAGE_Menu0303_ErrSet;
+    int value = 0;
+
+    if((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis();
+        }
+        else if(page_control->control_id == 103)//所有记录
+        {
+            menu_waiting = menu_format_all_record;
+            App_Menu_Page_Sw (PAGE_FormatEnsure);
+        }
+    }
+    else if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        sscanf ((const char*) page_control->param_addr, "%d", &value);
+        if (page_control->control_id == 55)
+        {
+            if(value >= g_sensor_o2.save.user_dis.err_temp_up)
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            else
+            {
+                g_sensor_o2.save.user_dis.err_temp_low =  (float)value;
+            }
+        }
+        else if (page_control->control_id == 28)
+        {
+            if(value <= g_sensor_o2.save.user_dis.err_temp_low)
+            {
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            }
+            else
+            {
+                g_sensor_o2.save.user_dis.err_temp_up =  (float)value;
+            }
+        }
+    }
+}
+
+//传感器维护
+static void H_F_LdSensor_infoSet(void)
+{
+    uint16_t screen_id_temp = PAGE_LdSensor_infoSet;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (34, (int32_t) g_life.sensor.save.sensor_limit_time);
+    BatchSetTextInt32 (29, (int32_t) g_menu.sensor_time);
+    BatchSetTextInt32 (6, (int32_t) g_life.sensor.save.sensor_adj_cyc);
+    BatchSetText (4, g_life.sensor.save.sensor_adj_date); //校准日期
+    BatchSetText (8, g_life.sensor.save.sensor_adj_user); //校准员
+    BatchEnd ();
+    AnimationPlayFrame (screen_id_temp, 14, g_life.sensor.save.sensor_time_switch);
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_LdSensor_infoSet(void)
+{
+    ;
+}
+
+static void H_O_LdSensor_infoSet(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_LdSensor_infoSet;
+    uint16_t Len = 0;
+    uint8_t  i = 0;
+    int val_temp;
+
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 8) //校准员
+        {
+            Len = (uint16_t) GetStringLen (g_page.param_addr);
+            for (i = 0; i < Len; i++)
+            {
+                g_life.sensor.save.sensor_adj_user[i] = *g_page.param_addr;
+                g_page.param_addr++;
+            }
+            if (14 - Len > 0)
+            {
+                for (; i < 14; i++)
+                    g_life.sensor.save.sensor_adj_user[i] = 0;
+            }
+        }
+        else if (page_control->control_id == 34) //传感器寿命
+        {
+            sscanf ((const char*) g_page.param_addr, "%6d", &val_temp);
+            g_life.sensor.save.sensor_limit_time = (uint32_t) val_temp;
+        }
+        else if (page_control->control_id == 29) //使用时间
+        {
+            sscanf ((const char*) g_page.param_addr, "%6d", &val_temp);
+            g_menu.sensor_time = (uint32_t) val_temp;
+            g_sensor_o2.data_para.write_sensor_message = sensor_run_time;
+        }
+        else if (page_control->control_id == 6) //校准周期
+        {
+            sscanf ((const char*) g_page.param_addr, "%6d", &val_temp);
+            g_life.sensor.save.sensor_adj_cyc = (uint32_t) val_temp;
+        }
+    }
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+
+        else if (page_control->control_id == 9)
+        {
+            sprintf ((char*) g_life.sensor.save.sensor_adj_date, "20%d-%02d-%02d", g_hmi.para.hmi_time.year,
+                     g_hmi.para.hmi_time.month, g_hmi.para.hmi_time.date);
+            BatchBegin (screen_id_temp);
+            BatchSetText (4, g_life.sensor.save.sensor_adj_date); //校准日期
+            BatchEnd ();
+        }
+        else if (page_control->control_id == 11)
+        {
+            if(g_life.sensor.save.sensor_time_switch)
+                g_life.sensor.save.sensor_time_switch = 0;
+            else
+                g_life.sensor.save.sensor_time_switch = 1;
+            AnimationPlayFrame (screen_id_temp, 14, g_life.sensor.save.sensor_time_switch);
+        }
+    }
+}
+
+//仪器信息
+static void H_F_Analysis_inf(void)
+{
+    uint16_t screen_id_temp = PAGE_Analysis_inf;
+
+    BatchBegin (screen_id_temp);
+    BatchSetTextInt32 (7, (int32_t) g_menu.runtime);       //运行时间
+    BatchSetText (1, (uint8_t*) g_hmi.save.num_model);    //仪器型号
+    BatchSetText (2, (uint8_t*) g_hmi.save.num_series);   //整机编号
+    BatchSetTextInt32 (8, g_modbus.save.fac_code);
+    BatchSetTextInt32 (5, (int) g_menu.save.heating_time);
+    BatchSetTextDouble (38, (double) *g_var_temp.fac_dis.pointer_upp ,  g_var_temp.val_digits);
+    BatchSetTextDouble (39, (double) *g_var_temp.fac_dis.pointer_low ,  g_var_temp.val_digits);
+    BatchEnd ();
+    SetSelectorValue (screen_id_temp, 222, g_menu.save.protocol_sel);   //通信协议选择
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Analysis_inf(void)
+{
+    ;
+}
+
+static void H_O_Analysis_inf(PAGE_CONTROL *page_control)
+{
+    int value, i = 0, val_temp = 0;
+    uint16_t Len = 0;
+    char data[14] = { 0 };
+    double fvalue;
+    uint16_t screen_id_temp = PAGE_Analysis_inf;
+    uint8_t *p = page_control->param_addr;
+
+    sscanf ((const char*) page_control->param_addr, "%d", &value);
+    Len = (uint16_t) GetStringLen (page_control->param_addr);
+    for (i = 0; i < Len; i++)
+    {
+        data[i] = (char) *p;
+        p++;
+    }
+    if (14 - Len > 0)
+    {
+        for (; i < 14; i++)
+            data[i] = 0;
+    }
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 7)//运行时间
+        {
+            g_menu.runtime = (uint32_t) value;
+            val_temp = App_Sensor_Work_Time_Count ();
+            if (value >= val_temp)
+                value = val_temp - 1;
+            g_life.main.save.now_limit_use_time = (int) value;
+        }
+        else if (page_control->control_id == 1)
+        {
+            if(data[0] == 0)
+            {
+                BatchBegin (screen_id_temp);
+                BatchSetText (1, (uint8_t*) g_hmi.save.num_model);    //仪器型号
+                BatchEnd ();
+            }
+            else
+            {
+                for (i = 0; i < 14; i++)
+                {
+                    g_hmi.save.num_model[i] = (uint8_t) data[i];
+                }
+            }
+        }
+        else if (page_control->control_id == 2)
+        {
+            if(data[0] == 0)
+            {
+                BatchBegin (screen_id_temp);
+                BatchSetText (2, (uint8_t*) g_hmi.save.num_series);   //整机编号
+                BatchEnd ();
+            }
+            else
+            {
+                for (i = 0; i < 14; i++)
+                {
+                    g_hmi.save.num_series[i] = (uint8_t) data[i];
+                }
+            }
+        }
+    }
+
+    //范围
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fvalue = (double) atof ((const char*) page_control->param_addr);
+        if (fvalue > 0)
+            fvalue += 0.0001f;    //字符串转float
+        else if (fvalue < 0)
+            fvalue -= 0.0001f;    //字符串转float
+
+        if (page_control->control_id == 38)
+        {
+            if (fvalue  < *g_var_temp.fac_dis.pointer_low || fvalue < 0 || fvalue >= 1000000)
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            else
+                (*g_var_temp.fac_dis.pointer_upp) = fvalue;
+            BatchBegin (screen_id_temp);
+            BatchSetTextDouble (38, (double) *g_var_temp.fac_dis.pointer_upp ,  g_var_temp.val_digits);
+            BatchSetTextDouble (39, (double) *g_var_temp.fac_dis.pointer_low ,  g_var_temp.val_digits);
+            BatchEnd ();
+        }
+        else if (page_control->control_id == 39)
+        {
+            if (fvalue  > *g_var_temp.fac_dis.pointer_upp || fvalue < 0 || fvalue >= 1000000 )
+                App_Menu_Page_Sw (PAGE_Set_Error);
+            else
+                (*g_var_temp.fac_dis.pointer_low) = fvalue ;
+            BatchBegin (screen_id_temp);
+            BatchSetTextDouble (38, (double) *g_var_temp.fac_dis.pointer_upp ,  g_var_temp.val_digits);
+            BatchSetTextDouble (39, (double) *g_var_temp.fac_dis.pointer_low ,  g_var_temp.val_digits);
+            BatchEnd ();
+        }
+    }
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis ();
+        }
+
+        else if (page_control->control_id == 6)
+        {
+            App_Menu_Page_Sw (PAGE_FacInitialEnsure);
+        }
+        else if (page_control->control_id == 34)
+        {
+            menu_waiting = menu_formating;
+            App_Menu_Page_Sw (PAGE_FormatEnsure);
+        }
+    }
+    if ((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        sscanf ((const char*) page_control->param_addr, "%d", &value);
+        if (page_control->control_id == 8)
+        {
+            g_db9_modbus.save.fac_code = g_net_modbus.save.fac_code = g_modbus.save.fac_code = (uint16_t) value;
+        }
+        else if (page_control->control_id == 5)
+        {
+            g_menu.save.heating_time = (uint32_t) value;
+        }
+    }
+
+    //菜单
+    if ((page_control->control_type == kCtrlMenu) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 333)
+        {
+            g_menu.save.protocol_sel = *page_control->param_addr;
+        }
+    }
+}
+
+
+//格式化确定界面
+static void H_F_FormatEnsure(void)
+{
+    SetScreen (PAGE_FormatEnsure);
+}
+
+static void H_P_FormatEnsure(void)
+{
+    ;
+}
+
+static void H_O_FormatEnsure(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_FormatEnsure;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 1)
+        {
+            App_Menu_Page_Sw (PAGE_Waiting);
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//保存工厂确定界面
+static void H_F_SaveFacEnsure(void)
+{
+    SetScreen (PAGE_SaveFacEnsure);
+}
+
+static void H_P_SaveFacEnsure(void)
+{
+    ;
+}
+
+static void H_O_SaveFacEnsure(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_SaveFacEnsure;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 1)
+        {
+            g_flash_var.com_save_flag = data_handle_all_fac_save;
+            App_Menu_Page_Sw (PAGE_SaveRes);
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+//初始化确认界面
+static void H_F_FacInitialEnsure(void)
+{
+    SetScreen (PAGE_FacInitialEnsure);
+}
+
+static void H_P_FacInitialEnsure(void)
+{
+    ;
+}
+
+static void H_O_FacInitialEnsure(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_FacInitialEnsure;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 4)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id == 3)
+        {
+            g_flash_save.first_save_flag[0] = 0;
+            App_First_Power_On (1);    //不执行用户和工厂保存
+            Var_To_Pointer_Initial();
+            App_Menu_Page_Sw (PAGE_Successfully);
+        }
+    }
+}
+
+//流量控制
+static void H_F_FlowControl(void)
+{
+    uint16_t screen_id_temp = PAGE_FlowControl;
+
+    BatchBegin(screen_id_temp);
+    BatchSetTextInt32(60,   g_motor.save.all_step_close);
+    BatchSetTextInt32(61,   (int)g_motor.save.run_curr);
+    BatchSetTextInt32(62,   (int)g_motor.save.hold_curr);
+    BatchSetTextInt32(63,   (int)g_motor.save.place_init_curr);
+    BatchSetTextFloat(64,   g_flow.save.control_flow_error / 1000 , 1);//控制误差
+    BatchSetTextInt32(65,   g_motor.para.g_step_count);//当前步数
+    BatchSetTextInt32(66, (int) g_flow.save.flow_step_low);//控制步数下限
+    BatchSetTextInt32(67, (int) g_flow.save.flow_step_upp);//控制步数上限
+    BatchSetTextFloat(68,   g_flow.save.cal_flow_c, 2);//标定C
+    BatchSetTextFloat(69,   g_flow.save.cal_flow_k , 4);//标定K
+    BatchEnd();
+    SetScreen(screen_id_temp);
+}
+
+static void H_P_FlowControl(void)
+{
+;
+}
+
+static void H_O_FlowControl(PAGE_CONTROL *page_control)
+{
+    float fval_temp = 0;
+    int val_temp = 0;
+    uint16_t screen_id_temp = PAGE_FlowControl;
+
+    if((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        fval_temp = (float)atof((const char *)page_control->param_addr);
+        if(fval_temp > 0)
+            fval_temp += 0.00001f;
+        else if (fval_temp < 0)
+            fval_temp -= 0.00001f;
+        sscanf((const char *)g_page.param_addr, "%6d", &val_temp);
+
+        if(page_control->control_id == 60)
+        {
+            g_motor.save.all_step_close = (uint16_t)val_temp;
+        }
+        else if(page_control->control_id == 61)
+        {
+            g_motor.save.run_curr = (float)val_temp;
+        }
+        else if(page_control->control_id == 62)
+        {
+            g_motor.save.hold_curr = (float)val_temp;
+        }
+        else if(page_control->control_id == 63)
+        {
+            g_motor.save.place_init_curr = (float)val_temp;
+        }
+        else if(page_control->control_id == 64)
+        {
+            g_flow.save.control_flow_error = (int)(fval_temp * 1000);
+        }
+        else if(page_control->control_id == 65)
+        {
+            g_motor.para.control_step = (int16_t)((int16_t)fval_temp - g_motor.para.g_step_count);
+        }
+        else if(page_control->control_id == 66)
+        {
+            g_flow.save.flow_step_low = (int)fval_temp;
+        }
+        else if(page_control->control_id == 67)
+        {
+            g_flow.save.flow_step_upp = (int)fval_temp;
+        }
+        else if(page_control->control_id == 68)
+        {
+            g_flow.save.cal_flow_c = fval_temp;
+        }
+        else if(page_control->control_id == 69)
+        {
+            g_flow.save.cal_flow_k = fval_temp;
+        }
+    }
+
+    if((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            App_Return_Main_Dis();
+        }
+    }
+}
+
+//保存结果
+static void H_F_SaveRes(void)
+{
+    SetScreen (PAGE_SaveRes);
+}
+
+static void H_P_SaveRes(void)
+{
+    ;
+}
+
+static void H_O_SaveRes(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_SaveRes;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 3)
+        {
+            App_Menu_Page_Back_Twice ();
+        }
+    }
+}
+
+//登录界面
+static void H_F_UserLogin(void)
+{
+    uint16_t screen_id_temp = PAGE_UserLogin;
+    static uint8_t frist_run = 0;
+
+    if(frist_run == 0)//上电第一次进入
+    {
+        strcpy((char*)name_temp , "USER");
+        strcpy((char*)password_temp , "   \0");
+        frist_run = 1;
+        g_user_manage.save.rember_password_sw = 0;
+    }
+    else
+    {
+        if(g_user_manage.save.rember_password_sw)//记录开关打开显示当前用户和密码
+        {
+            ;
+        }
+        else
+        {
+            strcpy((char*)password_temp , "   \0");
+        }
+    }
+
+    BatchBegin(screen_id_temp);
+    BatchSetText(4, name_temp);
+    BatchSetText(3, password_temp);
+    BatchEnd();
+
+    if(g_user_manage.save.rember_password_sw)//记录开关打开显示当前用户和密码
+    {
+         AnimationPlayFrame(screen_id_temp, 44, 1);//显示图标
+    }
+    else
+    {
+        AnimationPlayFrame(screen_id_temp, 44, 0);//显示图标
+    }
+    SetScreen(screen_id_temp);
+    //计算通用密码标志位置位
+    g_password.run_flag = 1;
+}
+
+static void H_P_UserLogin(void)
+{
+    ;
+}
+
+static void H_O_UserLogin(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_UserLogin;
+    uint8_t i , use_type = 0;
+    uint16_t Len=0;
+    char data[14]={0};
+
+    if((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if(page_control->control_id == 501)
+        {
+            App_Return_Main_Dis();
+        }
+        else if(page_control->control_id == 500)
+        {
+            App_Return_Main_Dis();
+        }
+        else if(page_control->control_id == 42)
+        {
+           //对比密码和用户名
+            use_type = Login_contrast(name_temp , password_temp);
+
+            if(use_type == 0)//用户密码错误
+            {
+                App_Menu_Page_Sw(PAGE_PasswordErr);
+                g_user_manage.para.now_type = 0;
+            }
+            else
+            {
+                //g_ld_sensor.update_sensor_data_flag = 1;//登录成功读取一次所有设置参数
+                (*g_var_temp.sensor.pointer_data_flag_update) = 1;
+                App_Menu_Page_Sw(PAGE_permission_user_interface);//权限页面
+                strcpy((char*)name_temp , (char*)g_user_manage.para.now_user.user_name);
+                strcpy((char*)password_temp , (char*)g_user_manage.para.now_user.user_password);
+                g_user_manage.para.now_type = use_type;
+            }
+        }
+        else if(page_control->control_id == 1)
+        {
+            if(g_user_manage.save.rember_password_sw)
+                g_user_manage.save.rember_password_sw = 0;
+            else
+                g_user_manage.save.rember_password_sw = 1;
+            AnimationPlayFrame(screen_id_temp, 44, g_user_manage.save.rember_password_sw);//显示图标
+        }
+        else if(page_control->control_id == 6)
+        {
+            App_Menu_Page_Sw(PAGE_UserLoginlistdis);
+        }
+    }
+    if((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        //计算通用密码标志位置位
+        g_password.run_flag = 1;
+
+        Len=(uint16_t)GetStringLen(page_control->param_addr);
+        for(i = 0 ;i < Len;i++)
+        {
+            data[i]=(char)*page_control->param_addr;
+            page_control->param_addr++;
+        }
+        if(14-Len>0)
+        {
+            for(;i<14;i++)
+                data[i]=0;
+        }
+        if(page_control->control_id == 4)
+        {
+            for(i=0; i<14; i++)
+            {
+                name_temp[i] = (uint8_t)data[i];
+            }
+        }
+        else if(page_control->control_id == 3)
+        {
+            for(i=0; i<14; i++)
+            {
+                password_temp[i] = (uint8_t)data[i];
+            }
+        }
+    }
+}
+
+
+/*
+ * 名称：用户列表操作页面
+ * 输入：无
+ * 输出：无
+ */
+uint8_t temp_frist_set_list = 0;    //list的勾状态 0不限 1先
+static void H_F_User_management(void)
+{
+    uint16_t screen_id_temp = PAGE_User_management;
+    uint8_t i=0,y=0,dis_point;
+    uint8_t dis_temp[50]={0};
+    uint8_t para = 0;
+
+    Clear_History_Data(screen_id_temp,1);
+
+    memset(&g_user_manage.para.new_alter_user,0,sizeof(g_user_manage.para.new_alter_user));
+
+    temp_frist_set_list = 0;
+    for(i = 0 ; i < 7 ; i++)
+    {
+        dis_point=0;
+        for(y=0; y<14; y++)
+        {
+            if(g_user_manage.save.user_list[i].user_name[y] == 0)
+                break;
+            dis_temp[dis_point++] = g_user_manage.save.user_list[i].user_name[y];
+        }
+        dis_temp[dis_point++] = ';';
+        for(y=0; y<14; y++)
+        {
+            if(g_user_manage.save.user_list[i].user_password[y] == 0)
+                break;
+            dis_temp[dis_point++] = g_user_manage.save.user_list[i].user_password[y];
+        }
+        dis_temp[dis_point++] = ';';
+        dis_temp[dis_point++] = ' ';
+        dis_temp[dis_point++] = ';';
+        History_Data_Display(screen_id_temp, 1, dis_temp);
+    }
+    para = g_user_manage.save.user_admin.user_name[15];
+    g_user_manage.save.user_admin.user_name[15] = '\0';//让其以字符串结尾
+
+    //管理员
+    BatchBegin(screen_id_temp);
+    BatchSetText(50, (uint8_t *)&g_user_manage.save.user_admin.user_name);
+    g_user_manage.save.user_admin.user_name[15] = para;
+    BatchSetText(51, (uint8_t *)&g_user_manage.save.user_admin.user_password);
+    BatchEnd();
+
+    BatchBegin(screen_id_temp);
+    for(y=0; y<7; y++)
+    {
+        if(g_user_manage.para.now_choose_list == y)
+        {
+            BatchSetFrame(11+y, 1);
+        }
+        else
+        {
+            BatchSetFrame(11+y, 0);
+        }
+    }
+    BatchEnd();
+
+    SetScreen(screen_id_temp);
+}
+
+/*
+ * 名称：用户列表操作周期性函数
+ * 输入：无
+ * 返回：无
+ */
+static void H_P_User_management(void)
+{
+    ;
+}
+
+/*
+ * 名称：用户管理
+ * 输入：转接指令结构体
+ * 返回：无
+ */
+static void H_O_User_management(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_User_management;
+    uint8_t y=0,j=0,i=0 , data[20] = {0};
+    uint16_t  Len=0;
+
+    if((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        Len = (uint16_t)GetStringLen(page_control->param_addr);
+        for(i=0;i<Len;i++)
+        {
+           data[i]=(uint8_t)*page_control->param_addr;
+           page_control->param_addr++;
+        }
+        if(14-Len>0)
+        {
+           for(;i<14;i++)
+               data[i] = 0;
+        }
+        if(page_control->control_id == 50)
+        {
+            if(strlen((char*)data) == 0)
+            {
+                App_Menu_Page_Sw(PAGE_Set_Error);
+            }
+            else
+            {
+                for(i=0; i<14; i++)
+                {
+                    g_user_manage.save.user_admin.user_name[i] = (uint8_t)data[i];
+                }
+                g_user_manage.save.user_admin.user_name[14] = 0;//字符串需要以0结尾
+            }
+        }
+        else if(page_control->control_id == 51)
+        {
+            if(strlen((char*)data) == 0)
+            {
+                App_Menu_Page_Sw(PAGE_Set_Error);
+            }
+            else
+            {
+                for(i=0; i<14; i++)
+                {
+                    g_user_manage.save.user_admin.user_password[i] = (uint8_t)data[i];
+                }
+                g_user_manage.save.user_admin.user_password[14] = 0;
+            }
+        }
+    }
+
+    if(page_control->control_type == kCtrlButton && page_control->screen_id == PAGE_User_management)
+    {
+        if(page_control->control_id <= 27 && page_control->control_id >= 21 )//对应屏上的1-7行勾勾
+        {
+            g_user_manage.para.now_choose_list = (uint8_t)(page_control->control_id - 21);
+            BatchBegin(screen_id_temp);
+            for(y=0; y<7; y++)
+            {
+               BatchSetFrame(11+y, 0);
+            }
+            BatchSetFrame(11+g_user_manage.para.now_choose_list, 1);
+            BatchEnd();
+        }
+
+        if(page_control->control_id == 40)//看
+        {
+            //所选用户密码为空则不能
+            if(strlen((char*)g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_name) == 0 || strlen((char*)g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_password) == 0)
+            {
+                App_Menu_Page_Sw(PAGE_Set_Error);
+            }
+            else
+            {
+                strcpy((char*)(g_user_manage.para.new_alter_user.user_name),(char*)(g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_name));
+                strcpy((char*)(g_user_manage.para.new_alter_user.user_password),(char*)(g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_password));
+                strcpy((char*)(g_user_manage.para.new_alter_user.user_root),(char*)(g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_root));
+                App_Menu_Page_Sw(PAGE_Add_user_interface);
+            }
+        }
+        else if(page_control->control_id == 41)//改
+        {
+            //所选用户密码为空则不能
+            if(strlen((char*)g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_name) == 0 || strlen((char*)g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_password) == 0)
+            {
+                App_Menu_Page_Sw(PAGE_Set_Error);
+            }
+            else
+            {
+                strcpy((char*)(g_user_manage.para.new_alter_user.user_name),(char*)(g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_name));
+                strcpy((char*)(g_user_manage.para.new_alter_user.user_password),(char*)(g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_password));
+                strcpy((char*)(g_user_manage.para.new_alter_user.user_root),(char*)(g_user_manage.save.user_list[g_user_manage.para.now_choose_list].user_root));
+                App_Menu_Page_Sw(PAGE_Add_user_interface);
+            }
+        }
+        else if(page_control->control_id == 2)//删
+        {
+            App_Menu_Page_Sw(PAGE_delete_user);
+        }
+        else if(page_control->control_id == 3)//加
+        {
+            for(j = 0 ; j < 7; j++)
+            {
+                if(g_user_manage.save.user_list[j].user_name[0] == 0)
+                {
+                    g_user_manage.para.now_choose_list = j;
+                    break;
+                }
+            }
+            if(j == 7)
+            {
+                App_Menu_Page_Sw(PAGE_Set_Error);
+            }
+            else
+            {
+                App_Menu_Page_Sw(PAGE_Add_user_interface);
+            }
+            strcpy((char*)(g_user_manage.para.new_alter_user.user_name),"\0");
+            strcpy((char*)(g_user_manage.para.new_alter_user.user_password),"\0");
+            for(j = 0 ; j < ROOT_NUM; j++)
+            {
+                g_user_manage.para.new_alter_user.user_root[j] = 0;
+            }
+        }
+        if(page_control->control_id == BUTTON_RETURN)
+        {
+            g_user_manage.para.now_choose_list = 0;//清除当前选中的用户
+            App_Menu_Page_Back();
+        }
+        else if(page_control->control_id == BUTTON_MAIN)
+        {
+            g_user_manage.para.now_choose_list = 0;//清除当前选中的用户
+            App_Return_Main_Dis();
+        }
+    }
+}
+
+//删除用户确定界面
+static void H_F_delete_user(void)
+{
+    SetScreen (PAGE_delete_user);
+}
+
+static void H_P_delete_user(void)
+{
+    ;
+}
+
+static void H_O_delete_user(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_delete_user;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 1)
+        {
+            user_manage_delete (g_user_manage.para.now_choose_list);
+            App_Menu_Page_Sw (PAGE_Successfully);
+        }
+        else if (page_control->control_id == 2)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+/*
+ * 名称：用户权限设置界面
+ * 输入：无
+ * 返回：无
+ */
+uint8_t user_toot_temp[20];
+
+/*
+ * 说明 用于将权限临时 变量中的值赋值到修改变量中
+ */
+static void fun_root_temp_to_alter_user(void)
+{
+    uint8_t i = 0, y = 0;
+    for (i = 0; i < 20; i++)
+    {
+        if (user_toot_temp[i] != 0)
+        {
+            g_user_manage.para.new_alter_user.user_root[y] = i + 1;    //当前权限计算枚举值
+            y++;
+        }
+    }
+    for (; y < 5; y++)    //清除未选中状态的权限
+    {
+        g_user_manage.para.new_alter_user.user_root[y] = 0;
+    }
+}
+
+static void H_F_Add_user_interface(void)
+{
+    uint16_t screen_id_temp = PAGE_Add_user_interface;
+    uint8_t i = 0;
+
+    BatchBegin (screen_id_temp);
+    BatchSetText (21, (uint8_t*) g_user_manage.para.new_alter_user.user_name);
+    BatchSetText (20, (uint8_t*) g_user_manage.para.new_alter_user.user_password);
+    BatchEnd ();
+    memset (user_toot_temp, 0, sizeof(user_toot_temp));
+    BatchBegin (screen_id_temp);
+    for (i = 0; i < 5; i++)
+        BatchSetFrame (i + 1, 0);
+    for (i = 0; i < 5; i++)
+    {
+        if (g_user_manage.para.new_alter_user.user_root[i])    //新更改的用户权限
+        {
+            user_toot_temp[g_user_manage.para.new_alter_user.user_root[i] - 1] = 1;
+            BatchSetFrame (g_user_manage.para.new_alter_user.user_root[i], 1);
+        }
+    }
+    BatchEnd ();
+
+    SetScreen (screen_id_temp);
+}
+
+/*
+ * 名称：用户列表操作周期性函数
+ * 输入：无
+ * 返回：无
+ */
+static void H_P_Add_user_interface(void)
+{
+    ;
+}
+
+/*
+ * 名称：用户列表操作页面运行函数
+ * 输入：转接指令结构体
+ * 返回：无
+ */
+static void H_O_Add_user_interface(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Add_user_interface;
+    uint16_t i=0 , Len=0;
+    uint8_t  data[20];
+
+    if((page_control->control_type == kCtrlText) && (page_control->screen_id == screen_id_temp))
+    {
+        Len=(uint16_t)GetStringLen(page_control->param_addr);
+        for(i = 0 ; i < Len; i++)
+        {
+            data[i]=(uint8_t)*page_control->param_addr;
+            page_control->param_addr++;
+        }
+        if(14-Len>0)
+        {
+            for(;i<14;i++)
+                data[i]=0;
+        }
+
+        if(page_control->control_id == 21)
+        {
+            for(i=0; i<14; i++)
+            {
+                g_user_manage.para.new_alter_user.user_name[i] = (uint8_t)data[i];
+            }
+        }
+        else if(page_control->control_id == 20)
+        {
+            for(i = 0; i < 14; i++)
+            {
+                g_user_manage.para.new_alter_user.user_password[i] = (uint8_t)data[i];
+            }
+        }
+    }
+    //1.点击按钮后，入栈进行跳转
+    if(page_control->control_type == kCtrlButton && page_control->screen_id == screen_id_temp)
+    {
+        if(page_control->control_id < 15 && page_control->control_id > 9)
+        {
+            if(user_toot_temp[page_control->control_id - 10] == 1)
+                user_toot_temp[page_control->control_id - 10] = 0;
+            else
+                user_toot_temp[page_control->control_id - 10] = 1;
+            fun_root_temp_to_alter_user();
+            H_F_Add_user_interface();
+        }
+        if(page_control->control_id == 40)
+        {
+            if(strlen((char*)g_user_manage.para.new_alter_user.user_name) == 0 || strlen((char*)g_user_manage.para.new_alter_user.user_password) == 0)
+            {
+                App_Menu_Page_Sw(PAGE_Set_Error);
+            }
+            else
+            {
+                //判断用户名和密码是否已经存在  存在则不添加
+                if(user_manage_add(g_user_manage.para.new_alter_user.user_name , g_user_manage.para.new_alter_user.user_password))
+                {
+                    App_Menu_Page_Sw(PAGE_Set_Error);
+                }
+                else
+                {
+                    App_Menu_Page_Back();
+                }
+            }
+        }
+        else if(page_control->control_id == 41)
+        {
+            App_Menu_Page_Back();
+        }
+    }
+}
+
+//用户列表界面显示
+static void H_F_UserLoginlistdis(void)
+{
+    uint16_t screen_id_temp = PAGE_UserLoginlistdis;
+    uint8_t i = 0, y = 0, dis_point;
+    uint8_t dis_temp[50] ={ 0 };
+
+    Clear_History_Data (screen_id_temp, 1);
+    for (i = 0; i < 7; i++)    //用户列表
+    {
+        dis_point = 0;
+        if (g_user_manage.save.user_list[i].user_name[0] == 0)
+            break;
+        for (y = 0; y < 14; y++)
+        {
+            if (g_user_manage.save.user_list[i].user_name[y] == 0)
+                break;
+            dis_temp[dis_point++] = g_user_manage.save.user_list[i].user_name[y];
+        }
+        dis_temp[dis_point++] = ';';
+        History_Data_Display (screen_id_temp, 1, dis_temp);
+    }
+    i++;
+    dis_point = 0;
+    for (y = 0; y < 14; y++)    //用户管理员
+    {
+        if (g_user_manage.save.user_admin.user_name[y] == 0)
+            break;
+        dis_temp[dis_point++] = g_user_manage.save.user_admin.user_name[y];
+    }
+    dis_temp[dis_point++] = ';';
+    History_Data_Display (screen_id_temp, 1, dis_temp);
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_UserLoginlistdis(void)
+{
+    ;
+}
+
+static void H_O_UserLoginlistdis(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_UserLoginlistdis;
+    uint8_t choose_num = 0, i = 0;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id >= 50 && page_control->control_id <= 53)
+        {
+            App_Menu_Page_Back ();
+        }
+        else if (page_control->control_id >= 21 && page_control->control_id <= 29)
+        {
+            choose_num = (uint8_t) (page_control->control_id - 21);
+            for (i = 0; i < 7; i++)    //用户列表
+            {
+                if (g_user_manage.save.user_list[i].user_name[0] == 0)
+                    break;
+            }
+            if (choose_num >= i)
+            {
+                if (choose_num == i)
+                {
+                    for (i = 0; i < 14; i++)
+                    {
+                        name_temp[i] = (uint8_t) g_user_manage.save.user_admin.user_name[i];
+                    }
+                }
+                else
+                {
+                    for (i = 0; i < 14; i++)
+                    {
+                        name_temp[i] = 0;
+                    }
+                }
+            }
+            else
+            {
+                for (i = 0; i < 14; i++)
+                {
+                    name_temp[i] = (uint8_t) g_user_manage.save.user_list[choose_num].user_name[i];
+                }
+            }
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+
+
+////网络设置完成
+//static void H_F_InternetSet_res(void)
+//{
+//    SetScreen (PAGE_InternetSet_Res);
+//}
+//
+//static void H_P_InternetSet_res(void)
+//{
+//    ;
+//}
+//
+//static void H_O_InternetSet_res(PAGE_CONTROL *page_control)
+//{
+//    uint16_t screen_id_temp = PAGE_InternetSet_Res;
+//
+//    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+//    {
+//        if (page_control->control_id == 3)
+//        {
+//            App_Menu_Page_Back_Three ();
+//        }
+//    }
+//}
+
+
+
+/*
+ * 说明：主界面--关闭外部控制提示
+ * 输入：无
+ * 输出：无
+ */
+static void H_F_PAGE_ex_control_tip(void)
+{
+    SetScreen (PAGE_ex_control_tip);
+}
+
+static void H_P_PAGE_ex_control_tip(void)
+{
+    ;
+}
+
+static void H_O_PAGE_ex_control_tip(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_ex_control_tip))
+    {
+        if (page_control->control_id == 3)
+        {
+            App_Menu_Page_Back ();
+        }
+    }
+}
+
+
+
+
+
+
+//等待界面
+uint16_t Waiting_time, Waiting_time_count;
+static void H_F_Waiting(void)
+{
+    uint16_t screen_id_temp = PAGE_Waiting;
+
+    if (menu_waiting == menu_flow_cal)
+        Waiting_time = 10;    //5s
+    else if (menu_waiting == menu_formating)
+        Waiting_time = 3;    //40s
+    else if (menu_waiting == menu_format_conc_record)
+        Waiting_time = 3;    //40s
+    else if (menu_waiting == menu_format_pre_record)
+        Waiting_time = 3;    //40s
+    else if (menu_waiting == menu_format_temp_record)
+        Waiting_time = 3;    //40s
+    else if (menu_waiting == menu_format_all_record)
+        Waiting_time = 3;    //40s
+    else if (menu_waiting == menu_ref_set)    //恢复设置
+        Waiting_time = 7;
+    else if (menu_waiting == menu_internet_set)
+        Waiting_time = 20;    //5s
+    else if (menu_waiting == menu_cal_micro)
+        Waiting_time = 10;    //5s
+    else if (menu_waiting == menu_flow_set)
+        Waiting_time = 20;    //3min
+    else if (menu_waiting == menu_flow_ctrl)
+        Waiting_time = 5;    //20s
+    else if (menu_waiting == menu_work_doubleo2)    //双氧传感器-工作设置界面
+        Waiting_time = 5;
+    else if(menu_waiting == menu_usb_export)
+        Waiting_time = 5;
+    else if(menu_waiting == menu_flow_close)
+        Waiting_time = 5;
+    else if(menu_waiting == menu_flow_open)
+        Waiting_time = 5;
+    else if(menu_waiting == menu_flow_cur_cail)
+        Waiting_time = 5;
+    else if(menu_waiting == menu_valve_cal)
+        Waiting_time = 5;
+
+    ///工作设置界面
+    if (menu_waiting == menu_work_doubleo2)
+    {
+        if (temp_doubleo2_ctrl.sw_ppm_upp <= temp_doubleo2_ctrl.sw_ppm_low)
+        {
+            temp_doubleo2_ctrl.res_set = 1;
+        }
+        else
+        {
+            vTaskDelay (50);
+        }
+    }
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Waiting(void)
+{
+    menu_delay(50);//延时
+    if(Waiting_time)
+        Waiting_time--;
+
+    if(Waiting_time == 0)//等待时间到达
+    {
+        if(menu_waiting == menu_flow_cal)//在流量标定页面触发等待页面
+        {
+            App_Menu_Page_Sw(PAGE_FlowADJ_res);//切换到流量标定结果
+        }
+        else if(menu_waiting == menu_formating)
+        {
+            App_Format_Data(8);//格式化存储
+            App_Menu_Page_Sw(PAGE_Successfully);//切换到格式化完成
+        }
+        else if(menu_waiting == menu_format_all_record)
+        {
+            App_Format_Data(7);//格式化存储
+            App_Menu_Page_Sw(PAGE_Successfully);//切换到格式化完成
+        }
+        else if(menu_waiting == menu_ref_set)//恢复设置
+        {
+            App_Menu_Page_Sw(PAGE_RecoverResult);//读取所有参数
+        }
+        else if(menu_waiting == menu_internet_set)//网络设置
+        {
+            App_Menu_Page_Sw(PAGE_Successfully);
+        }
+        else if(menu_waiting == menu_flow_set)
+        {
+            App_Menu_Page_Back_Twice();
+        }
+        else if(menu_waiting == menu_usb_export)//数据存储界面
+        {
+            if(g_usb_export_data.usb_export_flag == 0 )//导出操作标志  0 完成 1开始
+            {
+                if(g_usb_output.usb_export_result == -1)//失败
+                {
+                    App_Menu_Page_Sw(PAGE_Set_Error);
+                }
+                else
+                {
+                    App_Menu_Page_Sw(PAGE_Successfully);
+                }
+            }
+        }
+
+        if(menu_waiting == menu_cal_micro)
+        {
+            App_Menu_Page_Sw(PAGE_CalRes_DoubleO2);//切换到标定结果
+        }
+    }
+}
+static void H_O_Waiting(PAGE_CONTROL *page_control)
+{
+    FSP_PARAMETER_NOT_USED(page_control); //目的不让编译器报警告
+}
+
+//操作成功界面
+static void H_F_Successfully(void)
+{
+    SetScreen (PAGE_Successfully);
+}
+
+static void H_P_Successfully(void)
+{
+    ;
+}
+
+static void H_O_Successfully(PAGE_CONTROL *page_control)
+{
+    uint16_t screen_id_temp = PAGE_Successfully;
+
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == screen_id_temp))
+    {
+        if (page_control->control_id == 3)
+        {
+            if(menu_waiting == menu_formating || menu_waiting == menu_internet_set || menu_waiting == menu_format_all_record)
+                App_Menu_Page_Back_Three();
+            else
+                App_Menu_Page_Back_Twice ();
+        }
+    }
+}
+
+//设置错误界面
+static void H_F_Set_Error(void)
+{
+    uint16_t screen_id_temp = PAGE_Set_Error;
+
+    SetScreen (screen_id_temp);
+}
+
+static void H_P_Set_Error(void)
+{
+    ;
+}
+
+static void H_O_Set_Error(PAGE_CONTROL *page_control)
+{
+    if ((page_control->control_type == kCtrlButton) && (page_control->screen_id == PAGE_Set_Error))
+    {
+        if (page_control->control_id == 4)
+        {
+            if(menu_waiting == menu_usb_export)
+            {
+                menu_waiting = NONE;
+                App_Menu_Page_Back_Twice();
+            }
+            else
+            {
+                App_Menu_Page_Back ();
+            }
+        }
+    }
+}
+
+
+
+/**************************************************** 菜单运行列表************************************** ***********************************************************/
+//主显示界面前
+const PAGE_FUNC_CALSS page_non_menu_fun_run[]=
+{
+     {.f_f = H_F_WelcomePage,          .f_p = H_P_WelcomePage,          .f_o = H_O_WelcomePage,            .page_id = PAGE_WelcomePage},       //开机界面
+     {.f_f = H_F_HeatPage,             .f_p = H_P_HeatPage,             .f_o = H_O_HeatPage,               .page_id = PAGE_HeatPage},          //预热界面
+};
+
+//菜单内函数运行结构体
+const PAGE_FUNC_CALSS page_fun_run[]=
+{
+/********************************************************** 公共部分 ****************************************************************************/
+     {.f_f = H_F_MainPage,                  .f_p = H_P_MainPage,                    .f_o = H_O_MainPage,                    .page_id = PAGE_MainPage},
+     {.f_f = H_F_dis_status,                .f_p = H_P_dis_status,                  .f_o = H_O_dis_status,                  .page_id = PAGE_dis_status},
+     {.f_f = H_F_FlowSet,                   .f_p = H_P_FlowSet,                     .f_o = H_O_FlowSet,                     .page_id = PAGE_FlowSet},
+     {.f_f = H_F_PAGE_control_flow_upper,   .f_p = H_P_PAGE_control_flow_upper,     .f_o = H_O_PAGE_control_flow_upper,     .page_id = PAGE_control_flow_upper},
+     {.f_f = H_F_TendencyChart,             .f_p = H_P_TendencyChart,               .f_o = H_O_TendencyChart,               .page_id = PAGE_TendencyChart},
+     {.f_f = H_F_OpenTest,                  .f_p = H_P_OpenTest,                    .f_o = H_O_OpenTest,                    .page_id = PAGE_OpenTest},
+     {.f_f = H_F_PAGE_ex_control_tip,       .f_p = H_P_PAGE_ex_control_tip,         .f_o = H_O_PAGE_ex_control_tip,         .page_id = PAGE_ex_control_tip},
+     {.f_f = H_F_permission_user_interface, .f_p = H_P_permission_user_interface,   .f_o = H_O_permission_user_interface,   .page_id = PAGE_permission_user_interface},
+     {.f_f = H_F_MainMenu,                  .f_p = H_P_MainMenu,                    .f_o = H_O_MainMenu,                    .page_id = PAGE_MainMenu},
+     {.f_f = H_F_BasicSet,                  .f_p = H_P_BasicSet,                    .f_o = H_O_BasicSet,                    .page_id = PAGE_BasicSet},
+     {.f_f = H_F_InOutput,                  .f_p = H_P_InOutput,                    .f_o = H_O_InOutput,                    .page_id = PAGE_InOutput},
+     {.f_f = H_F_AnalogOutPutSet12,         .f_p = H_P_AnalogOutPutSet12,           .f_o = H_O_AnalogOutPutSet12,           .page_id = PAGE_AnalogOut12_Set},
+     {.f_f = H_F_AnalogOutPut12,            .f_p = H_P_AnalogOutPut12,              .f_o = H_O_AnalogOutPut12,              .page_id = PAGE_AnalogOutPut12},
+     {.f_f = H_F_AnalogOutPutAdj12,         .f_p = H_P_AnalogOutPutAdj12,           .f_o = H_O_AnalogOutPutAdj12,           .page_id = PAGE_AnalogOutPut12_Adj},
+     {.f_f = H_F_Ex_control,                .f_p = H_P_Ex_control,                  .f_o = H_O_Ex_control,                  .page_id = PAGE_Ex_control},
+     {.f_f = H_F_Comms_PD,                  .f_p = H_P_Comms_PD,                    .f_o = H_O_Comms_PD,                    .page_id = PAGE_Comms_PD},
+     {.f_f = H_F_AlarmOutPutDefine,         .f_p = H_P_AlarmOutPutDefine,           .f_o = H_O_AlarmOutPutDefine,           .page_id = PAGE_AlarmOutPutDefine},
+     {.f_f = H_F_InternetSet,               .f_p = H_P_InternetSet,                 .f_o = H_O_InternetSet,                 .page_id = PAGE_InternetSet},
+     {.f_f = H_F_InternetSet_Ensure,        .f_p = H_P_InternetSet_Ensure,          .f_o = H_O_InternetSet_Ensure,          .page_id = PAGE_InternetSet_Ensure},
+     {.f_f = H_F_Comms_DB9,                 .f_p = H_P_Comms_DB9,                   .f_o = H_O_Comms_DB9,                   .page_id = PAGE_Comms_DB9},
+     {.f_f = H_F_Analog_Input,              .f_p = H_P_Analog_Input,                .f_o = H_O_Analog_Input,                .page_id = PAGE_Analog_Input},
+     {.f_f = H_F_Infor,                     .f_p = H_P_Infor,                       .f_o = H_O_Infor,                       .page_id = PAGE_Infor},
+     {.f_f = H_F_Infor_certificate,         .f_p = H_P_Infor_certificate,           .f_o = H_O_Infor_certificate,           .page_id = PAGE_Infor_certificate},
+  //////////////////////////   {.f_f = H_F_DataSave,                  .f_p = H_P_DataSave,                    .f_o = H_O_DataSave,                    .page_id = PAGE_DataSave},
+     {.f_f = H_F_DataQuery,                 .f_p = H_P_DataQuery,                   .f_o = H_O_DataQuery,                   .page_id = PAGE_DataQuery},
+     {.f_f = H_F_DataNoFound,               .f_p = H_P_DataNoFound,                 .f_o = H_O_DataNoFound,                 .page_id = PAGE_DataNoFound},
+     {.f_f = H_F_PAGE_U_disk_Error,         .f_p = H_P_PAGE_U_disk_Error,           .f_o = H_O_PAGE_U_disk_Error,           .page_id =PAGE_U_disk_Error},
+     {.f_f = H_F_Menu0124,                  .f_p = H_P_Menu0124,                    .f_o = H_O_Menu0124,                    .page_id = PAGE_Menu0124},
+     {.f_f = H_F_FlowADJ,                   .f_p = H_P_FlowADJ,                     .f_o = H_O_FlowADJ,                     .page_id = PAGE_FlowADJ},
+     {.f_f = H_F_flowadjEnsure,             .f_p = H_P_flowadjEnsure,               .f_o = H_O_flowadjEnsure,               .page_id = PAGE_flowadjEnsure},
+     {.f_f = H_F_FlowADJ_res,               .f_p = H_P_FlowADJ_res,                 .f_o = H_O_FlowADJ_res,                 .page_id = PAGE_FlowADJ_res},
+     {.f_f = H_F_Common_Set,                .f_p = H_P_Common_Set,                  .f_o = H_O_Common_Set,                  .page_id = PAGE_Common_Set},
+     {.f_f = H_F_Sensor_protect,            .f_p = H_P_Sensor_protect,              .f_o = H_O_Sensor_protect,              .page_id = PAGE_Sensor_protect},
+     {.f_f = H_F_SaveUserSet,               .f_p = H_P_SaveUserSet,                 .f_o = H_O_SaveUserSet,                 .page_id = PAGE_SaveUserSet},
+
+     {.f_f = H_F_Menu0918_DoubleO2,         .f_p = H_P_Menu0918_DoubleO2,           .f_o = H_O_Menu0918_DoubleO2,           .page_id = PAGE_Menu0918_DoubleO2},
+     {.f_f = H_F_CalEnsure_DoubleO2,        .f_p = H_P_CalEnsure_DoubleO2,          .f_o = H_O_CalEnsure_DoubleO2,          .page_id = PAGE_CalEnsure_DoubleO2},
+     {.f_f = H_F_CalRes_DoubleO2,           .f_p = H_P_CalRes_DoubleO2,             .f_o = H_O_CalRes_DoubleO2,             .page_id = PAGE_CalRes_DoubleO2},
+     {.f_f = H_F_0330_DoubleO2_Cal_Para,    .f_p = H_P_0330_DoubleO2_Cal_Para,      .f_o = H_O_0330_DoubleO2_Cal_Para,      .page_id = PAGE_Menu0330_DoubleO2_Cal_Para},
+     {.f_f = H_F_Menu1028Page,              .f_p = H_P_Menu1028Page,                .f_o = H_O_Menu1028Page,                .page_id = PAGE_Menu1028Page},
+     {.f_f = H_F_DataRecovery,              .f_p = H_P_DataRecovery,                .f_o = H_O_DataRecovery,                .page_id = PAGE_DataRecovery},
+     {.f_f = H_F_RecoverUser,               .f_p = H_P_RecoverUser,                 .f_o = H_O_RecoverUser,                 .page_id = PAGE_RecoverUser},
+     {.f_f = H_F_RecoverFac,                .f_p = H_P_RecoverFac,                  .f_o = H_O_RecoverFac,                  .page_id = PAGE_RecoverFac},
+     {.f_f = H_F_RecoverResult,             .f_p = H_P_RecoverResult,               .f_o = H_O_RecoverResult,               .page_id = PAGE_RecoverResult},
+
+
+     {.f_f = H_F_Authority_Set_Page,        .f_p = H_P_Authority_Set_Page,          .f_o = H_O_Authority_Set_Page,          .page_id = PAGE_Authority_Set},
+     {.f_f = H_F_Trial_Hint_Page,           .f_p = H_P_Trial_Hint_Page,             .f_o = H_O_Trial_Hint_Page,             .page_id = PAGE_Trial_Hint},
+     {.f_f = H_F_TrialPasswordInput,        .f_p = H_P_TrialPasswordInput,          .f_o = H_O_TrialPasswordInput,          .page_id = PAGE_TrialPasswordInput},
+
+     {.f_f = H_F_PasswordErr,               .f_p = H_P_PasswordErr,                 .f_o = H_O_PasswordErr,                 .page_id = PAGE_PasswordErr},
+
+     {.f_f = H_F_Menu0204,                  .f_p = H_P_Menu0204,                    .f_o = H_O_Menu0204,                    .page_id = PAGE_Menu0204},
+     {.f_f = H_F_Menu0303,                  .f_p = H_P_Menu0303,                    .f_o = H_O_Menu0303,                    .page_id = PAGE_Menu0303},
+     {.f_f = H_F_0303_DoubleO2_Sensor_Set,  .f_p = H_P_0303_DoubleO2_Sensor_Set,    .f_o = H_O_0303_DoubleO2_Sensor_Set,    .page_id = PAGE_Menu0303_DoubleO2_Sensor_Set},
+     {.f_f = H_F_0303_DoubleO2_Sensor_Info, .f_p = H_P_0303_DoubleO2_Sensor_Info,   .f_o = H_O_0303_DoubleO2_Sensor_Info,   .page_id = PAGE_Menu0303_DoubleO2_Sensor_Info},
+     {.f_f = H_F_Menu0303_Err,              .f_p = H_P_Menu0303_Err,                .f_o = H_O_Menu0303_Err,                .page_id = PAGE_Menu0303_Err},
+     {.f_f = H_F_Menu0303_ErrConc,          .f_p = H_P_Menu0303_ErrConc,            .f_o = H_O_Menu0303_ErrConc,            .page_id = PAGE_Menu0303_ErrConc},
+     {.f_f = H_F_Menu0303_ErrPre,           .f_p = H_P_Menu0303_ErrPre,             .f_o = H_O_Menu0303_ErrPre,             .page_id = PAGE_Menu0303_ErrPre},
+     {.f_f = H_F_Menu0303_ErrTemp,          .f_p = H_P_Menu0303_ErrTemp,            .f_o = H_O_Menu0303_ErrTemp,            .page_id = PAGE_Menu0303_ErrTemp},
+     {.f_f = H_F_Menu0303_ErrSet,           .f_p = H_P_Menu0303_ErrSet,             .f_o = H_O_Menu0303_ErrSet,             .page_id = PAGE_Menu0303_ErrSet},
+     {.f_f = H_F_LdSensor_infoSet,          .f_p = H_P_LdSensor_infoSet,            .f_o = H_O_LdSensor_infoSet,            .page_id = PAGE_LdSensor_infoSet},
+     {.f_f = H_F_Analysis_inf,              .f_p = H_P_Analysis_inf,                .f_o = H_O_Analysis_inf,                .page_id = PAGE_Analysis_inf},
+     {.f_f = H_F_FormatEnsure,              .f_p = H_P_FormatEnsure,                .f_o = H_O_FormatEnsure,                .page_id = PAGE_FormatEnsure},
+     {.f_f = H_F_SaveFacEnsure,             .f_p = H_P_SaveFacEnsure,               .f_o = H_O_SaveFacEnsure,               .page_id = PAGE_SaveFacEnsure},
+     {.f_f = H_F_FacInitialEnsure,          .f_p = H_P_FacInitialEnsure,            .f_o = H_O_FacInitialEnsure,            .page_id = PAGE_FacInitialEnsure},
+     {.f_f = H_F_FlowControl,               .f_p = H_P_FlowControl,                 .f_o = H_O_FlowControl,                 .page_id = PAGE_FlowControl},
+     {.f_f = H_F_SaveRes,                   .f_p = H_P_SaveRes,                     .f_o = H_O_SaveRes,                     .page_id = PAGE_SaveRes},
+     {.f_f = H_F_User_management,           .f_p = H_P_User_management,             .f_o = H_O_User_management,             .page_id = PAGE_User_management},
+     {.f_f = H_F_Add_user_interface,        .f_p = H_P_Add_user_interface,          .f_o = H_O_Add_user_interface,          .page_id = PAGE_Add_user_interface},
+     {.f_f = H_F_delete_user,               .f_p = H_P_delete_user,                 .f_o = H_O_delete_user,                 .page_id = PAGE_delete_user},
+     {.f_f = H_F_UserLogin,                 .f_p = H_P_UserLogin,                   .f_o = H_O_UserLogin,                   .page_id = PAGE_UserLogin},
+     {.f_f = H_F_UserLoginlistdis,          .f_p = H_P_UserLoginlistdis,            .f_o = H_O_UserLoginlistdis,            .page_id = PAGE_UserLoginlistdis},
+     {.f_f = H_F_Waiting,                   .f_p = H_P_Waiting,                     .f_o = H_O_Waiting,                     .page_id = PAGE_Waiting},
+     {.f_f = H_F_Successfully,              .f_p = H_P_Successfully,                .f_o = H_O_Successfully,                .page_id = PAGE_Successfully},
+     {.f_f = H_F_Set_Error,                 .f_p = H_P_Set_Error,                   .f_o = H_O_Set_Error,                   .page_id = PAGE_Set_Error},
+};
+
+/**************************************************** 运行函数 ****************************************************************************************************/
+/*
+ * 说明：数据取出最大值函数--此处为11个数据进行比较--曲线界面
+ * 输入：要比较的数据
+ * 输出：当前的最大数据
+ */
+float arry_max1_his[13] =
+{ -200, -200, -200, -200, -200, -200, -200, -200, -200, -200, -200, -200, -200 };
+float arry_min1_his[13] =
+{ 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000 };
+static void his_sorting_function(float max_data, float min_data)
+{
+    float max = 0, min = 0;
+    uint8_t i;
+
+    for (i = 0; i < 11; i++)
+    {
+        arry_max1_his[i] = arry_max1_his[i + 1];
+        arry_min1_his[i] = arry_min1_his[i + 1];
+    }
+
+    arry_max1_his[11] = max_data;
+    arry_min1_his[11] = min_data;
+
+    for (i = 0; i < 12; i++)
+    {
+        if (arry_max1_his[i] > max)
+        {
+            max = arry_max1_his[i];
+        }
+
+        if (arry_min1_his[i] < min)
+        {
+            min = arry_min1_his[i];
+        }
+    }
+
+    arry_max1_his[12] = max;  //数组的12号元素存的为此数组的最大值
+    arry_min1_his[12] = min;
+}
+
+/*
+ * 说明：数据取出最大值函数--此处为11个数据进行比较--主显示
+ * 输入：要比较的数据
+ * 输出：当前的最大数据
+ */
+float arry_max1_main[13] =
+{ -200, -200, -200, -200, -200, -200, -200, -200, -200, -200, -200, -200, -200 };
+float arry_min1_main[13] =
+{ 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000, 1000000 };
+static void main_sorting_function(float max_data, float min_data)
+{
+    float max = 0, min = 0;
+    uint8_t i;
+
+    for (i = 0; i < 11; i++)
+    {
+        arry_max1_main[i] = arry_max1_main[i + 1];
+        arry_min1_main[i] = arry_min1_main[i + 1];
+    }
+
+    arry_max1_main[11] = max_data;
+    arry_min1_main[11] = min_data;
+
+    for (i = 0; i < 12; i++)
+    {
+        if (arry_max1_main[i] > max)
+        {
+            max = arry_max1_main[i];
+        }
+
+        if (arry_min1_main[i] < min)
+        {
+            min = arry_min1_main[i];
+        }
+    }
+
+    arry_max1_main[12] = max;
+    arry_min1_main[12] = min;
+}
+
+/*
+ * 说明历史数据的曲线显示，包含主界面和趋势显示界面  放在菜单运行函数运行  20ms   5s写入一个数据  自适应纵坐标
+ * 输入：无
+ * 输出：无
+ */
+static void Historical_data_curve_display(void)
+{
+    float dis_value;
+    static float temp_dis_upp_main = 0, temp_dis_low_main = 0, temp_divide_main, curr_dis_upp_main = -200,
+            curr_dis_low_main = 1000000;
+    static float temp_dis_upp_his = 0, temp_dis_low_his = 0, temp_divide_his, curr_dis_upp_his = -200,
+            curr_dis_low_his = 1000000;
+    static uint32_t point_temp_main, point_temp_his;  //点计数
+
+//主界面显示浓度值
+    dis_value = (*g_var_temp.sensor.pointer_user_dis_tent);
+
+//取极值
+    if (dis_value > curr_dis_upp_main)
+    {
+        curr_dis_upp_main = dis_value;
+    }
+    if (dis_value < curr_dis_low_main)
+    {
+        curr_dis_low_main = dis_value;
+    }
+    if (dis_value > curr_dis_upp_his)
+    {
+        curr_dis_upp_his = dis_value;
+    }
+    if (dis_value < curr_dis_low_his)
+    {
+        curr_dis_low_his = dis_value;
+    }
+
+//取本屏和上次屏的最大值 最小值
+    if (arry_max1_main[12] >= curr_dis_upp_main)
+        temp_dis_upp_main = arry_max1_main[12];
+    else
+        temp_dis_upp_main = curr_dis_upp_main;
+
+    if (arry_min1_main[12] <= curr_dis_low_main)
+        temp_dis_low_main = arry_min1_main[12];
+    else
+        temp_dis_low_main = curr_dis_low_main;
+
+    if (arry_max1_his[12] >= curr_dis_upp_his)
+        temp_dis_upp_his = arry_max1_his[12];
+    else
+        temp_dis_upp_his = curr_dis_upp_his;
+    if (arry_min1_his[12] <= curr_dis_low_his)
+        temp_dis_low_his = arry_min1_his[12];
+    else
+        temp_dis_low_his = curr_dis_low_his;
+
+//等分后跳转曲线最大最小值
+    temp_divide_main = (temp_dis_upp_main - temp_dis_low_main) / 8;  //等分8分
+    temp_divide_his = (temp_dis_upp_his - temp_dis_low_his) / 8;  //等分8分
+    g_hmi.para.flag_Historical_curve_refresh++;
+    if (g_hmi.para.flag_Historical_curve_refresh > 250)  //5s写入一组曲线数据--250
+    {
+        HistoryGraph_Data_Dis (PAGE_TendencyChart, 1, (uint8_t*) &dis_value);
+        Historical_curve_range (PAGE_TendencyChart, 1, (int) (temp_dis_upp_his + temp_divide_his + 1),
+                                (int) (temp_dis_low_his - temp_divide_his - 1));  //显示坐标纵坐标范围
+
+        HistoryGraph_Data_Dis (PAGE_MainPage, 12, (uint8_t*) &dis_value);
+        Historical_curve_range (PAGE_MainPage, 12, (int) (temp_dis_upp_main + temp_divide_main + 1),
+                                (int) (temp_dis_low_main - temp_divide_main - 1));  //显示坐标纵坐标范围
+
+        g_hmi.para.flag_Historical_curve_refresh = 0;
+
+        //点数记录判断
+        point_temp_main++;
+        if (point_temp_main > 72)  //720是曲线的最大点数
+        {
+            point_temp_main = 0;
+            main_sorting_function (curr_dis_upp_main, curr_dis_low_main);
+            curr_dis_upp_main = -200;
+            curr_dis_low_main = 1000000;
+        }
+
+        point_temp_his++;
+        if (point_temp_his > 820)  //8192是曲线的最大点数
+        {
+            point_temp_his = 0;
+            his_sorting_function (curr_dis_upp_his, curr_dis_low_his);
+            curr_dis_upp_his = -200;
+            curr_dis_low_his = 1000000;
+        }
+    }
+}
+
+/*
+ * 功能：获取触摸屏时间  20ms运行
+ * 输入：无
+ * 输出：无
+ */
+void App_Get_Hmi_Time(void)
+{
+    if (g_hmi.para.flag_get_hmi_time_refresh)
+    {
+        GetRTCTime ();
+        g_hmi.para.flag_get_hmi_time_refresh = 0;
+    }
+}
+
+/*
+ * 功能：触摸屏非菜单显示函数  用于不在菜单的界面
+ * 输入：无
+ * 输出：无
+ */
+static void App_Display_Hmi_Non_Menu(void)
+{
+    int16_t page_id_now;               //当前页面
+    //1.将屏幕ID进行实时更新
+    page_id_now = g_position_now;
+
+    //2.若上一次的界面ID与本次界面ID不同，则运行本次界面ID的首次运行函数
+    if (page_id_last != page_id_now)    //上次的栈值不等于最新栈值（界面切换了）则运行首次函数  栈里面保存的是页面
+    {
+        //1、首次运行函数
+        if (page_non_menu_fun_run[page_id_now + MAX_NON_MENU_PAGE].f_f != NULL)
+            page_non_menu_fun_run[page_id_now + MAX_NON_MENU_PAGE].f_f ();
+    }
+    else    //等于则运行周期函数和控件处理函数
+    {
+        //2.周期函数（函数不为空&&周期性运行时间：500ms）
+        if ((page_non_menu_fun_run[page_id_now + MAX_NON_MENU_PAGE].f_p != NULL)
+                && g_hmi.para.flag_period_time_refresh > 12)
+        {
+            page_non_menu_fun_run[page_id_now + MAX_NON_MENU_PAGE].f_p ();
+            g_hmi.para.flag_period_time_refresh = 0;
+        }
+        //3.指令操作函数
+        if (g_page.cmd_type != 0)
+        {
+            if (page_non_menu_fun_run[page_id_now + MAX_NON_MENU_PAGE].f_o != NULL)
+                page_non_menu_fun_run[page_id_now + MAX_NON_MENU_PAGE].f_o (&g_page);
+            g_page.cmd_type = 0;
+        }
+    }
+
+    page_id_last = page_id_now;
+}
+
+/*
+ * 功能：用于触摸屏菜单显示的界面
+ * 输入：无
+ * 输出：无
+ */
+static void App_Display_Hmi_Menu(void)
+{
+    int16_t page_id_now = 0, temp_position;
+
+    //1.将屏幕ID进行实时更新
+    temp_position = g_position_now - 1;
+    if (temp_position < 0)
+        temp_position = 0;
+    page_id_now = g_stack[temp_position] - MAX_NON_MENU_PAGE; //减去非主界面的页面数
+    if (page_id_now < 0)
+        page_id_now = 0;
+
+    //2.若上一次的界面ID与本次界面ID不同，则运行本次界面ID的首次运行函数
+    if (page_id_last != page_id_now) //上次的栈值不等于最新栈值（界面切换了）则运行首次函数  栈里面保存的是页面
+    {
+        //1、首次运行函数
+        if (page_fun_run[page_id_now].f_f != NULL)
+            page_fun_run[page_id_now].f_f ();
+    }
+    else //等于则运行周期函数和控件处理函数
+    {
+        //2.周期函数（函数不为空&&周期性运行时间：500ms）
+        if ((page_fun_run[page_id_now].f_p != NULL) && g_hmi.para.flag_period_time_refresh > 15) //g_hmi.para.flag_period_time_refresh 用于控制周期函数多就运行一次
+        {
+            page_fun_run[page_id_now].f_p ();
+            g_hmi.para.flag_period_time_refresh = 0;
+        }
+
+        //3.指令操作函数
+        if (g_page.cmd_type != 0)
+        {
+            if (page_fun_run[page_id_now].f_o != NULL)
+                page_fun_run[page_id_now].f_o (&g_page);
+            g_page.cmd_type = 0;
+        }
+    }
+
+    page_id_last = page_id_now;
+}
+
+/*
+ * 说明：初始化使用参数默认值  放在首次上电运行函数
+ * 输入：无
+ * 输出：无
+ */
+void g_menu_save_para_init(void)
+{
+    //存储值
+    g_menu.runtime = 0;
+    g_menu.sensor_time = 0;
+    g_menu.save.heating_time = 60; //预热时间
+
+
+    g_menu.save.usbtime_sec = 1;
+
+    //协议选择
+    g_menu.save.protocol_sel = ODM;
+}
+
+/*
+ * 说明：菜单业务初始化，包含了显示屏的初始化
+ * 输入：无
+ * 输出：无
+ */
+void app_init_menu(void)
+{
+    App_HMI_Init (1);
+    user_manage_init (); //初始化用户 放在主循环前面
+    g_position_now = -MAX_NON_MENU_PAGE; //欢迎界面初始栈位置
+}
+
+/*
+ * 功能：屏幕菜单运行函数，所有屏的控制，显示菜单都是这个函数
+ * 输入：无
+ * 输出：无
+ * 返回：无
+ */
+void app_menu_Run(void)
+{
+    //取出屏指令并判断有无操作
+    if (App_HMI_ReceiveData_Handle ()) //有操作将返回时间清除
+    {
+        g_menu.back_conter = 600;
+    }
+
+    g_hmi.para.flag_period_time_refresh++; //界面周期运行函数时间
+    if (g_position_now >= 0) //栈位置  大于等于0 进入栈控制菜单
+    {
+        Historical_data_curve_display (); //历史趋势发送数据
+        App_Display_Hmi_Menu (); //主界面和菜单页面运行函数
+    }
+    else
+    {
+        App_Display_Hmi_Non_Menu (); //主界面之前的界面
+    }
+    App_Get_Hmi_Time ();
+}//主函数持续运行
+

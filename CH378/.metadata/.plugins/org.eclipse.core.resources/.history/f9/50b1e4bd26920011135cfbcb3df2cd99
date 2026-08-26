@@ -1,0 +1,71 @@
+/*
+ * H_hmi.c
+ *
+ *  Created on: 2024年3月6日
+ *      Author: Administrator
+ */
+
+#include "H_hmi.h"
+
+/*
+ * 说明：定时器初始化，定时器用于判断串口数据接受完成，并处理收到的数据
+ * 输入：无
+ * 输出：无
+ */
+void hmi_timer_init(void)
+{
+    R_AGT_Open(&agt_timer1_ctrl, &agt_timer1_cfg);
+    R_AGT_Start(&agt_timer1_ctrl);
+}
+
+
+/*
+ * 说明：
+ * 输入：无
+ * 输出：无
+ */
+void hmi_uart_init(void)
+{
+    R_SCI_UART_Open(&g_uart2_ctrl, &g_uart2_cfg);
+}
+
+/*
+ * 说明：串口屏电源使能
+ * 输入：无
+ * 输出：无
+ */
+void hmi_enable_power(void)
+{
+    R_IOPORT_PinWrite(&g_ioport_ctrl, DIS_POWER, 1);
+}
+
+/*
+ * 说明：串口屏通讯使能
+ * 输入：无
+ * 输出：无
+ */
+void hmi_enable_uart(void)
+{
+    R_IOPORT_PinWrite(&g_ioport_ctrl, DIS_EN, 1);
+}
+
+/*
+ * 说明：串口屏电源不使能
+ * 输入：无
+ * 输出：无
+ */
+void hmi_disenable_power(void)
+{
+    R_IOPORT_PinWrite(&g_ioport_ctrl, DIS_POWER, 0);
+}
+
+/*
+ * 说明：串口发送一个字节数据
+ * 输入：data:数据地址
+ * 输出：无
+ */
+void hmi_send_one_char(uint8_t data)
+{
+    uint8_t temp=data;
+    R_SCI_UART_Write(&g_uart3_ctrl, &temp, 1);
+}

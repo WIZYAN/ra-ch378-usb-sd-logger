@@ -1,0 +1,92 @@
+Extracting support files...
+16:07:38 **** Build of configuration Debug for project CH378 ****
+make -j12 all 
+Building file: ../src/hal_entry.c
+Building file: ../ra_gen/common_data.c
+Building file: ../ra_gen/hal_data.c
+Building file: ../ra_gen/main.c
+Building file: ../ra_gen/pin_data.c
+Building file: ../ra_gen/vector_data.c
+Building file: ../ra/fsp/src/r_sci_uart/r_sci_uart.c
+Building file: ../ra/fsp/src/r_ioport/r_ioport.c
+Building file: ../ra/fsp/src/r_gpt/r_gpt.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_common.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_clocks.c
+Building file: ../ra/fsp/src/r_icu/r_icu.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_group_irq.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_guard.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_io.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_delay.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_register_protection.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_irq.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_rom_registers.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_sbrk.c
+Building file: ../ra/fsp/src/bsp/cmsis/Device/RENESAS/Source/startup.c
+Building file: ../ra/fsp/src/bsp/mcu/all/bsp_security.c
+Building file: ../HMI/F_HMI.c
+Building file: ../ra/fsp/src/bsp/cmsis/Device/RENESAS/Source/system.c
+Building file: ../HMI/H_hmi.c
+Building file: ../CH378_USB/ch378_file_device.c
+Building file: ../HMI/app_hmi.c
+Building file: ../CH378_USB/ch378_hard.c
+Building file: ../CH378_USB/ch378_storage.c
+Building target: CH378.elf
+arm-none-eabi-objcopy -O srec "CH378.elf"  "CH378.srec"
+arm-none-eabi-size --format=berkeley "CH378.elf"
+   text	   data	    bss	    dec	    hex	filename
+  22652	    512	   3016	  26180	   6644	CH378.elf
+Extracting support files...
+16:13:01 **** Incremental Build of configuration Debug for project CH378 ****
+make -j12 all 
+Building file: ../HMI/F_HMI.c
+Building file: ../HMI/app_hmi.c
+Building target: CH378.elf
+arm-none-eabi-objcopy -O srec "CH378.elf"  "CH378.srec"
+arm-none-eabi-size --format=berkeley "CH378.elf"
+   text	   data	    bss	    dec	    hex	filename
+  22092	    840	   3288	  26220	   666c	CH378.elf
+Extracting support files...
+16:23:21 **** Incremental Build of configuration Debug for project CH378 ****
+make -j12 all 
+Building file: ../src/hal_entry.c
+Building target: CH378.elf
+arm-none-eabi-objcopy -O srec "CH378.elf"  "CH378.srec"
+arm-none-eabi-size --format=berkeley "CH378.elf"
+   text	   data	    bss	    dec	    hex	filename
+  22092	    840	   3288	  26220	   666c	CH378.elf
+Extracting support files...
+17:30:43 **** Incremental Build of configuration Debug for project CH378 ****
+make -j12 all 
+Building file: ../src/hal_entry.c
+Building file: ../HMI/F_HMI.c
+Building file: ../HMI/app_hmi.c
+Building file: ../HMI/H_hmi.c
+Building file: ../CH378_USB/ch378_file_device.c
+Building file: ../CH378_USB/ch378_storage.c
+Building file: ../CH378_USB/ch378_hard.c
+Building target: CH378.elf
+arm-none-eabi-objcopy -O srec "CH378.elf"  "CH378.srec"
+arm-none-eabi-size --format=berkeley "CH378.elf"
+   text	   data	    bss	    dec	    hex	filename
+  22616	    812	   3364	  26792	   68a8	CH378.elf
+Extracting support files...
+17:30:50 **** Incremental Build of configuration Debug for project CH378 ****
+make -j12 all 
+arm-none-eabi-size --format=berkeley "CH378.elf"
+   text	   data	    bss	    dec	    hex	filename
+  22616	    812	   3364	  26792	   68a8	CH378.elf
+Extracting support files...
+13:12:11 **** Incremental Build of configuration Debug for project CH378 ****
+make -j12 all 
+Building file: ../src/hal_entry.c
+Building file: ../HMI/F_HMI.c
+Building file: ../HMI/H_hmi.c
+Building file: ../HMI/app_hmi.c
+Building file: ../CH378_USB/ch378_file_device.c
+Building file: ../CH378_USB/ch378_hard.c
+Building file: ../CH378_USB/ch378_storage.c
+Building target: CH378.elf
+arm-none-eabi-objcopy -O srec "CH378.elf"  "CH378.srec"
+arm-none-eabi-size --format=berkeley "CH378.elf"
+   text	   data	    bss	    dec	    hex	filename
+  22616	    812	   3364	  26792	   68a8	CH378.elf

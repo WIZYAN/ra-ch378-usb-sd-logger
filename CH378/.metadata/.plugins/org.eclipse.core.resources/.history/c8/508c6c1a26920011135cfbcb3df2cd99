@@ -1,0 +1,30 @@
+/*
+ * menu_stack.h
+ *
+ *  Created on: 2024年3月7日
+ *      Author: Administrator
+ */
+
+#ifndef MENU_STACK_H_
+#define MENU_STACK_H_
+
+/*
+ * 说明：菜单运行的栈操作控制函数
+ */
+
+#define MAX_STACK 30 //最大栈数量
+
+#include "menu_data_update.h"
+
+
+extern int16_t  g_stack[MAX_STACK];        //栈数组
+extern int8_t   g_position_now;                    //当前栈位置
+
+void App_Menu_Page_Sw(int16_t page_id);
+void App_Menu_Page_Back(void);
+void App_Menu_Page_Back_Twice(void);
+void App_Menu_Page_Back_Three(void);
+void App_Return_Main_Dis();
+
+
+#endif /* MENU_STACK_H_ */

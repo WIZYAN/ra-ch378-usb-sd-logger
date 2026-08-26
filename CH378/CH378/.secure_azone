@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<azone>
+    <rzone name="R7FA6M4AF3CFB.rzone"/>
+    <partition>
+        <peripheral name="PORT1" group="PORT">
+            <slot name="P108" secure="false"/>
+            <slot name="P109" secure="false"/>
+            <slot name="P110" secure="false"/>
+            <slot name="P115" secure="false"/>
+        </peripheral>
+        <peripheral name="PORT3" group="PORT">
+            <slot name="P300" secure="false"/>
+            <slot name="P301" secure="false"/>
+            <slot name="P302" secure="false"/>
+        </peripheral>
+        <peripheral name="PORT5" group="PORT">
+            <slot name="P500" secure="false"/>
+            <slot name="P501" secure="false"/>
+            <slot name="P502" secure="false"/>
+            <slot name="P503" secure="false"/>
+            <slot name="P504" secure="false"/>
+            <slot name="P505" secure="false"/>
+            <slot name="P506" secure="false"/>
+            <slot name="P507" secure="false"/>
+        </peripheral>
+        <peripheral name="PORT6" group="PORT">
+            <slot name="P608" secure="false"/>
+        </peripheral>
+        <peripheral name="PORT7" group="PORT">
+            <slot name="P700" secure="false"/>
+            <slot name="P701" secure="false"/>
+            <slot name="P702" secure="false"/>
+            <slot name="P703" secure="false"/>
+            <slot name="P704" secure="false"/>
+            <slot name="P709" secure="false"/>
+        </peripheral>
+        <peripheral name="ICU_EXT_IRQ">
+            <slot name="ICU_EXT_IRQ10" secure="false"/>
+        </peripheral>
+        <peripheral name="SCI2" group="SCI" security=""/>
+        <peripheral name="GPT1" group="GPT" security=""/>
+        <peripheral name="ICU">
+            <slot name="IRQ0" secure="false"/>
+            <slot name="IRQ1" secure="false"/>
+            <slot name="IRQ2" secure="false"/>
+            <slot name="IRQ3" secure="false"/>
+            <slot name="IRQ4" secure="false"/>
+            <slot name="IRQ5" secure="false"/>
+        </peripheral>
+    </partition>
+</azone>

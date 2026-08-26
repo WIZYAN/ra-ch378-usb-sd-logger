@@ -1,0 +1,2131 @@
+/*
+ * A_HMI.c
+ *
+ *  Created on: 2024年1月25日
+ *      Author: CI
+ */
+#include <app_hmi.h>
+#include <app_menu.h>
+#include <F_HMI.h>
+#include "H_hmi.h"
+
+#include "stdio.h"
+#include "math.h"
+#include "stdlib.h"
+#include "string.h"
+
+/*************************   串口屏驱动   *************************/
+uint8_t cmd_buffer[CMD_MAX_SIZE];//指令缓存
+uint8_t HMI_rxChar[QUEUE_MAX_SIZE];//HMI_rxChar;
+uint16_t current_screen_id=0;
+uint8_t  hmi_tx_flag = 0 , hmi_rx_flag = 0;
+uint16_t  hmi_rx_len = 0;
+
+
+#define TX_8(P1) SEND_DATA((uint8_t)((P1)&0xFF))  //发送单个字节
+#define TX_8N(P,N) SendNuint8_t((uint8_t *)P,N)  //发送N个字节
+#define TX_16(P1) TX_8((P1)>>8);TX_8(P1)  //发送16位整数
+#define TX_16N(P,N) SendNuint16_t((uint16_t *)P,N)  //发送N个16位整数
+#define TX_32(P1) TX_16((P1)>>16);TX_16((P1)&0xFFFF)  //发送32位整数
+
+void SendChar(uint8_t t)
+{
+    uint16_t i=60000;
+    hmi_tx_flag = 0;
+    hmi_send_one_char(t);
+    while (!hmi_tx_flag)
+    {
+        i--;
+        if(i==0)
+            break;
+    }
+    //vTaskDelay(1);
+}
+
+static uint8_t dec_to_hex(uint8_t num)  //num=21
+{
+    uint8_t hex_num, shi, ge;
+
+    shi = num / 10;
+    ge = num % 10;
+
+    shi = (uint8_t)((shi & 0x0f) << 4);
+    ge = ge & 0x0f;
+
+    hex_num = shi | ge;
+
+    return hex_num;
+}
+
+#if(CRC16_ENABLE)
+
+static uint16_t _crc16 = 0xffff;
+static void AddCRC16(uint8_t *buffer,uint16_t n,uint16_t *pcrc)
+{
+    uint16_t i,j,carry_flag,a;
+
+    for (i=0; i<n; i++)
+    {
+        *pcrc=*pcrc^buffer[i];
+        for (j=0; j<8; j++)
+        {
+            a=*pcrc;
+            carry_flag=a&0x0001;
+            *pcrc=*pcrc>>1;
+            if (carry_flag==1)
+                *pcrc=*pcrc^0xa001;
+        }
+    }
+}
+
+uint16_t CheckCRC16(uint8_t *buffer,uint16_t n)
+{
+    uint16_t crc0 = 0x0;
+    uint16_t crc1 = 0xffff;
+
+    if(n>=2)
+    {
+        crc0 = ((buffer[n-2]<<8)|buffer[n-1]);
+        AddCRC16(buffer,n-2,&crc1);
+    }
+
+    return (crc0==crc1);
+}
+
+void SEND_DATA(uint8_t c)
+{
+    AddCRC16(&c,1,&_crc16);
+    SendChar(c);
+}
+
+void BEGIN_CMD()
+{
+    TX_8(0XEE);
+    _crc16 = 0XFFFF;//开始计算CRC16
+}
+
+void END_CMD()
+{
+    uint16_t crc16 = _crc16;
+    TX_16(crc16);//发送CRC16
+    TX_32(0XFFFCFFFF);
+}
+
+#else//NO CRC16
+
+#define SEND_DATA(P) SendChar(P)
+#define BEGIN_CMD() TX_8(0XEE)
+#define END_CMD() TX_32(0XFFFCFFFF)
+
+#endif
+
+void DelayMS(unsigned int n)
+{
+    uint32_t i,j;
+    for(i = n;i>0;i--)
+        for(j=1000;j>0;j--) ;
+}
+
+static void SendStrings(uint8_t *str)
+{
+    while(*str)
+    {
+        TX_8(*str);
+        str++;
+    }
+}
+
+static void SendNuint8_t(uint8_t *pData,uint16_t nDataLen)
+{
+    uint16_t i = 0;
+
+    for (;i<nDataLen;++i)
+    {
+        TX_8(pData[i]);
+    }
+}
+
+static void SendNuint16_t(uint16_t *pData,uint16_t nDataLen)
+{
+    uint16_t i = 0;
+
+    for (;i<nDataLen;++i)
+    {
+        TX_16(pData[i]);
+    }
+}
+
+void SetHandShake()
+{
+    BEGIN_CMD();
+    TX_8(0x00);
+    END_CMD();
+}
+
+void SetSensitivity(uint8_t coefficient)
+{
+    BEGIN_CMD();
+    TX_8(0x8A);
+    TX_8(0x5A);
+    TX_8(0xA5);
+    TX_8(coefficient);
+    END_CMD();
+}
+
+void SetFcolor(uint16_t color)
+{
+    BEGIN_CMD();
+    TX_8(0x41);
+    TX_16(color);
+    END_CMD();
+}
+
+void SetBcolor(uint16_t color)
+{
+    BEGIN_CMD();
+    TX_8(0x42);
+    TX_16(color);
+    END_CMD();
+}
+
+ void ColorPicker(uint8_t mode, uint16_t x,uint16_t y)
+{
+    BEGIN_CMD();
+    TX_8(0xA3);
+    TX_8(mode);
+    TX_16(x);
+    TX_16(y);
+    END_CMD();
+}
+
+void GUI_CleanScreen()
+{
+    BEGIN_CMD();
+    TX_8(0x01);
+    END_CMD();
+}
+
+void SetTextSpace(uint8_t x_w, uint8_t y_w)
+{
+    BEGIN_CMD();
+    TX_8(0x43);
+    TX_8(x_w);
+    TX_8(y_w);
+    END_CMD();
+}
+
+void SetFont_Region(uint8_t enable,uint16_t width,uint16_t height)
+{
+    BEGIN_CMD();
+    TX_8(0x45);
+    TX_8(enable);
+    TX_16(width);
+    TX_16(height);
+    END_CMD();
+}
+
+void SetFilterColor(uint16_t fillcolor_dwon, uint16_t fillcolor_up)
+{
+    BEGIN_CMD();
+    TX_8(0x44);
+    TX_16(fillcolor_dwon);
+    TX_16(fillcolor_up);
+    END_CMD();
+}
+
+void DisText(uint16_t x, uint16_t y,uint8_t back,uint8_t font,uint8_t *strings )
+{
+    BEGIN_CMD();
+    TX_8(0x20);
+    TX_16(x);
+    TX_16(y);
+    TX_8(back);
+    TX_8(font);
+    SendStrings(strings);
+    END_CMD();
+}
+
+void SetLanguage(uint8_t Language_ID)
+{
+    uint8_t check;
+    check=Language_ID + 0xC1;
+    BEGIN_CMD();
+    TX_8(0xC1);
+    TX_8(Language_ID);
+    TX_8(check);
+    END_CMD();
+}
+
+void SetLanguageToChinese()
+{
+    BEGIN_CMD();
+    TX_8(0xC1);
+    TX_8(0x00);
+    TX_8(0xC1);
+    END_CMD();
+}
+
+void SetLanguageToEnglish()
+{
+    BEGIN_CMD();
+    TX_8(0xC1);
+    TX_8(0x81);
+    TX_8(0x42);
+    END_CMD();
+}
+
+void DisCursor(uint8_t enable,uint16_t x, uint16_t y,uint8_t width,uint8_t height )
+{
+    BEGIN_CMD();
+    TX_8(0x21);
+    TX_8(enable);
+    TX_16(x);
+    TX_16(y);
+    TX_8(width);
+    TX_8(height);
+    END_CMD();
+}
+
+void DisFull_Image(uint16_t image_id,uint8_t masken)
+{
+    BEGIN_CMD();
+    TX_8(0x31);
+    TX_16(image_id);
+    TX_8(masken);
+    END_CMD();
+}
+
+void DisArea_Image(uint16_t x,uint16_t y,uint16_t image_id,uint8_t masken)
+{
+    BEGIN_CMD();
+    TX_8(0x32);
+    TX_16(x);
+    TX_16(y);
+    TX_16(image_id);
+    TX_8(masken);
+    END_CMD();
+}
+
+void DisCut_Image(uint16_t x,uint16_t y,uint16_t image_id,uint16_t image_x,uint16_t image_y,uint16_t image_l, uint16_t image_w,uint8_t masken)
+{
+    BEGIN_CMD();
+    TX_8(0x33);
+    TX_16(x);
+    TX_16(y);
+    TX_16(image_id);
+    TX_16(image_x);
+    TX_16(image_y);
+    TX_16(image_l);
+    TX_16(image_w);
+    TX_8(masken);
+    END_CMD();
+}
+
+void DisFlashImage(uint16_t x,uint16_t y,uint16_t flashimage_id,uint8_t enable,uint8_t playnum)
+{
+    BEGIN_CMD();
+    TX_8(0x80);
+    TX_16(x);
+    TX_16(y);
+    TX_16(flashimage_id);
+    TX_8(enable);
+    TX_8(playnum);
+    END_CMD();
+}
+
+void GUI_Dot(uint16_t x,uint16_t y)
+{
+    BEGIN_CMD();
+    TX_8(0x50);
+    TX_16(x);
+    TX_16(y);
+    END_CMD();
+}
+
+void GUI_Line(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
+{
+    BEGIN_CMD();
+    TX_8(0x51);
+    TX_16(x0);
+    TX_16(y0);
+    TX_16(x1);
+    TX_16(y1);
+    END_CMD();
+}
+
+void GUI_ConDots(uint8_t mode,uint16_t *dot,uint16_t dot_cnt)
+{
+    BEGIN_CMD();
+    TX_8(0x63);
+    TX_8(mode);
+    TX_16N(dot,dot_cnt*2);
+    END_CMD();
+}
+
+ void GUI_ConSpaceDots(uint16_t x,uint16_t x_space,uint16_t *dot_y,uint16_t dot_cnt)
+{
+    BEGIN_CMD();
+    TX_8(0x59);
+    TX_16(x);
+    TX_16(x_space);
+    TX_16N(dot_y,dot_cnt);
+    END_CMD();
+}
+
+void GUI_FcolorConOffsetDots(uint16_t x,uint16_t y,uint16_t *dot_offset,uint16_t dot_cnt)
+{
+    BEGIN_CMD();
+    TX_8(0x75);
+    TX_16(x);
+    TX_16(y);
+    TX_16N(dot_offset,dot_cnt);
+    END_CMD();
+}
+
+void GUI_BcolorConOffsetDots(uint16_t x,uint16_t y,uint8_t *dot_offset,uint16_t dot_cnt)
+{
+    BEGIN_CMD();
+    TX_8(0x76);
+    TX_16(x);
+    TX_16(y);
+    TX_16N(dot_offset,dot_cnt);
+    END_CMD();
+}
+
+void SetPowerSaving(uint8_t enable, uint8_t bl_off_level, uint8_t bl_on_level, uint8_t  bl_on_time)
+{
+    BEGIN_CMD();
+    TX_8(0x77);
+    TX_8(enable);
+    TX_8(bl_off_level);
+    TX_8(bl_on_level);
+    TX_8(bl_on_time);
+    END_CMD();
+}
+
+void GUI_FcolorConDots(uint16_t *dot,uint16_t dot_cnt)
+{
+    BEGIN_CMD();
+    TX_8(0x68);
+    TX_16N(dot,dot_cnt*2);
+    END_CMD();
+}
+
+void GUI_BcolorConDots(uint16_t *dot,uint16_t dot_cnt)
+{
+    BEGIN_CMD();
+    TX_8(0x69);
+    TX_16N(dot,dot_cnt*2);
+    END_CMD();
+}
+
+void GUI_Circle(uint16_t x, uint16_t y, uint16_t r)
+{
+    BEGIN_CMD();
+    TX_8(0x52);
+    TX_16(x);
+    TX_16(y);
+    TX_16(r);
+    END_CMD();
+}
+
+void GUI_CircleFill(uint16_t x, uint16_t y, uint16_t r)
+{
+    BEGIN_CMD();
+    TX_8(0x53);
+    TX_16(x);
+    TX_16(y);
+    TX_16(r);
+    END_CMD();
+}
+
+void GUI_Arc(uint16_t x,uint16_t y, uint16_t r,uint16_t sa, uint16_t ea)
+{
+    BEGIN_CMD();
+    TX_8(0x67);
+    TX_16(x);
+    TX_16(y);
+    TX_16(r);
+    TX_16(sa);
+    TX_16(ea);
+    END_CMD();
+}
+
+void GUI_Rectangle(uint16_t x0, uint16_t y0, uint16_t x1,uint16_t y1 )
+{
+    BEGIN_CMD();
+    TX_8(0x54);
+    TX_16(x0);
+    TX_16(y0);
+    TX_16(x1);
+    TX_16(y1);
+    END_CMD();
+}
+
+void GUI_RectangleFill(uint16_t x0, uint16_t y0, uint16_t x1,uint16_t y1 )
+{
+    BEGIN_CMD();
+    TX_8(0x55);
+    TX_16(x0);
+    TX_16(y0);
+    TX_16(x1);
+    TX_16(y1);
+    END_CMD();
+}
+
+void GUI_Ellipse(uint16_t x0, uint16_t y0, uint16_t x1,uint16_t y1 )
+{
+    BEGIN_CMD();
+    TX_8(0x56);
+    TX_16(x0);
+    TX_16(y0);
+    TX_16(x1);
+    TX_16(y1);
+    END_CMD();
+}
+
+void GUI_EllipseFill(uint16_t x0, uint16_t y0, uint16_t x1,uint16_t y1 )
+{
+    BEGIN_CMD();
+    TX_8(0x57);
+    TX_16(x0);
+    TX_16(y0);
+    TX_16(x1);
+    TX_16(y1);
+    END_CMD();
+}
+
+void SetBackLight(uint16_t light_level)
+{
+    uint8_t set_l;
+    set_l = (uint8_t)(uint16_t)(uint32_t)(int32_t)(((float)light_level / 1000) * 255);
+    BEGIN_CMD();
+    TX_8(0x60);
+    TX_8(255-set_l);
+    END_CMD();
+}
+
+void SetBuzzer(uint8_t time)
+{
+    BEGIN_CMD();
+    TX_8(0x61);
+    TX_8(time);
+    END_CMD();
+}
+
+void GUI_AreaInycolor(uint16_t x0, uint16_t y0, uint16_t x1,uint16_t y1 )
+{
+    BEGIN_CMD();
+    TX_8(0x65);
+    TX_16(x0);
+    TX_16(y0);
+    TX_16(x1);
+    TX_16(y1);
+    END_CMD();
+}
+
+void SetTouchPaneOption(uint8_t enbale,uint8_t beep_on,uint8_t work_mode,uint8_t press_calibration)
+{
+    uint8_t options = 0;
+
+    if(enbale)
+        options |= 0x01;
+    if(beep_on)
+        options |= 0x02;
+    if(work_mode)
+        options = (uint8_t)(options  | (work_mode<<2));
+    if(press_calibration)
+        options = (uint8_t)(options | (press_calibration<<5));
+
+    BEGIN_CMD();
+    TX_8(0x70);
+    TX_8(options);
+    END_CMD();
+}
+
+void CalibrateTouchPane()
+{
+    BEGIN_CMD();
+    TX_8(0x72);
+    END_CMD();
+}
+
+void TestTouchPane()
+{
+    BEGIN_CMD();
+    TX_8(0x73);
+    END_CMD();
+}
+
+void LockDeviceConfig(void)
+{
+    BEGIN_CMD();
+    TX_8(0x09);
+    TX_8(0xDE);
+    TX_8(0xED);
+    TX_8(0x13);
+    TX_8(0x31);
+    END_CMD();
+}
+
+void UnlockDeviceConfig(void)
+{
+    BEGIN_CMD();
+    TX_8(0x08);
+    TX_8(0xA5);
+    TX_8(0x5A);
+    TX_8(0x5F);
+    TX_8(0xF5);
+    END_CMD();
+}
+
+void SetCommBps(uint8_t option)
+{
+    BEGIN_CMD();
+    TX_8(0xA0);
+    TX_8(option);
+    END_CMD();
+}
+
+void WriteLayer(uint8_t layer)
+{
+    BEGIN_CMD();
+    TX_8(0xA1);
+    TX_8(layer);
+    END_CMD();
+}
+
+void DisplyLayer(uint8_t layer)
+{
+    BEGIN_CMD();
+    TX_8(0xA2);
+    TX_8(layer);
+    END_CMD();
+}
+
+void CopyLayer(uint8_t src_layer,uint8_t dest_layer)
+{
+    BEGIN_CMD();
+    TX_8(0xA4);
+    TX_8(src_layer);
+    TX_8(dest_layer);
+    END_CMD();
+}
+
+void ClearLayer(uint8_t layer)
+{
+    BEGIN_CMD();
+    TX_8(0x05);
+    TX_8(layer);
+    END_CMD();
+}
+
+void GUI_DispRTC(uint8_t enable,uint8_t mode,uint8_t font,uint16_t color,uint16_t x,uint16_t y)
+{
+    BEGIN_CMD();
+    TX_8(0x85);
+    TX_8(enable);
+    TX_8(mode);
+    TX_8(font);
+    TX_16(color);
+    TX_16(x);
+    TX_16(y);
+    END_CMD();
+}
+
+void WriteUserFlash(uint32_t startAddress,uint16_t length,uint8_t *_data)
+{
+    BEGIN_CMD();
+    TX_8(0x87);
+    TX_32(startAddress);
+    TX_8N(_data,length);
+    END_CMD();
+}
+
+void ReadUserFlash(uint32_t startAddress,uint16_t length)
+{
+    BEGIN_CMD();
+    TX_8(0x88);
+    TX_32(startAddress);
+    TX_16(length);
+    END_CMD();
+}
+
+void GetScreen(void)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x01);
+    END_CMD();
+}
+
+void GetRTCTime(void)
+{
+    BEGIN_CMD();
+    TX_8(0x82);
+    END_CMD();
+}
+
+void SetScreen(uint16_t screen_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x00);
+    TX_16(screen_id);
+    END_CMD();
+    current_screen_id = screen_id;
+}
+
+void SetScreenUpdateEnable(uint8_t enable)
+{
+    BEGIN_CMD();
+    TX_8(0xB3);
+    TX_8(enable);
+    END_CMD();
+}
+
+void SetControlFocus(uint16_t screen_id,uint16_t control_id,uint8_t focus)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x02);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(focus);
+    END_CMD();
+}
+
+void SetControlVisiable(uint16_t screen_id,uint16_t control_id,uint8_t visible)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x03);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(visible);
+    END_CMD();
+}
+
+void SetControlEnable(uint16_t screen_id,uint16_t control_id,uint8_t enable)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x04);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(enable);
+    END_CMD();
+}
+
+void SetButtonValue(uint16_t screen_id,uint16_t control_id,uint8_t state)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x10);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(state);
+    END_CMD();
+}
+
+void SetTextValue(uint16_t screen_id,uint16_t control_id,uint8_t *str)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x10);
+    TX_16(screen_id);
+    TX_16(control_id);
+    SendStrings(str);
+    END_CMD();
+}
+
+void SetProgressValue(uint16_t screen_id,uint16_t control_id,uint32_t value)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x10);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_32(value);
+    END_CMD();
+}
+
+void SetMeterValue(uint16_t screen_id,uint16_t control_id,uint32_t value)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x10);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_32(value);
+    END_CMD();
+}
+
+void SetSliderValue(uint16_t screen_id,uint16_t control_id,uint32_t value)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x10);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_32(value);
+    END_CMD();
+}
+
+void SetSelectorValue(uint16_t screen_id,uint16_t control_id,uint8_t item)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x10);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(item);
+    END_CMD();
+}
+
+void GetControlValue(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x11);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void AnimationStart(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x20);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void AnimationStop(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x21);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void AnimationPause(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x22);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void AnimationPlayFrame(uint16_t screen_id,uint16_t control_id,uint8_t frame_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x23);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(frame_id);
+    END_CMD();
+}
+
+void AnimationPlayPrev(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x24);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void AnimationPlayNext(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x25);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void GraphChannelAdd(uint16_t screen_id,uint16_t control_id,uint8_t channel,uint16_t color)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x30);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(channel);
+    TX_16(color);
+    END_CMD();
+}
+
+void GraphChannelDel(uint16_t screen_id,uint16_t control_id,uint8_t channel)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x31);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(channel);
+    END_CMD();
+}
+
+void GraphChannelDataAdd(uint16_t screen_id,uint16_t control_id,uint8_t channel,uint8_t *pData,uint16_t nDataLen)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x32);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(channel);
+    TX_16(nDataLen);
+    TX_8N(pData,nDataLen);
+    END_CMD();
+}
+
+void GraphChannelDataClear(uint16_t screen_id,uint16_t control_id,uint8_t channel)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x33);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(channel);
+    END_CMD();
+}
+
+void GraphSetViewport(uint16_t screen_id,uint16_t control_id,int16_t x_offset,uint16_t x_mul,int16_t y_offset,uint16_t y_mul)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x34);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_16(x_offset);
+    TX_16(x_mul);
+    TX_16(y_offset);
+    TX_16(y_mul);
+    END_CMD();
+}
+
+void BatchBegin(uint16_t screen_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x12);
+    TX_16(screen_id);
+}
+
+void BatchSetButtonValue(uint16_t control_id,uint8_t state)
+{
+    TX_16(control_id);
+    TX_16(1);
+    TX_8(state);
+}
+
+void BatchSetProgressValue(uint16_t control_id,uint32_t value)
+{
+    TX_16(control_id);
+    TX_16(4);
+    TX_32(value);
+}
+
+void BatchSetSliderValue(uint16_t control_id,uint32_t value)
+{
+    TX_16(control_id);
+    TX_16(4);
+    TX_32(value);
+}
+
+void BatchSetMeterValue(uint16_t control_id,uint32_t value)
+{
+    TX_16(control_id);
+    TX_16(4);
+    TX_32(value);
+}
+
+uint32_t GetStringLen(uint8_t *str)
+{
+    uint8_t *p = str;
+    uint32_t temp;
+
+    while(*str)
+    {
+        str++;
+    }
+    temp = (uint32_t)(str-p);
+
+    return (temp);
+}
+
+void BatchSetText(uint16_t control_id,uint8_t *strings)
+{
+    TX_16(control_id);
+    TX_16(GetStringLen(strings));
+    SendStrings(strings);
+}
+
+void BatchSetTextOne(uint16_t control_id,uint8_t strings)
+{
+    TX_16(control_id);
+    TX_16(1);
+    TX_8(strings);
+}
+
+void BatchSetTextTime(uint16_t control_id,int32_t value)
+{
+    int32_t y1,length=0;
+    uint8_t buf[2] = {0};
+    y1 = value;
+
+    TX_16(control_id);
+    TX_16(2);
+    if(value==0)
+    {
+        TX_8(0x30);
+        TX_8(0x30);
+    }
+    else if(value > 0)
+    {
+        while(y1)
+        {
+            y1/=10;
+            length++;
+        }
+        if(length==1)
+        {
+            TX_8(0x30);
+            TX_8(value + 0x30);
+        }
+        else if(length==2)
+        {
+            sprintf((char *)buf,"%ld",(long)value); //把整数转换为字符串
+            TX_8(buf[0]);
+            TX_8(buf[1]);
+        }
+    }
+}
+
+void BatchSetTextInt32(uint16_t control_id,int32_t value)
+{
+    int32_t y1,y2,i=0,x;
+
+    TX_16(control_id);
+    y1=value;
+    if(y1>=0)
+    {
+        y2=y1;
+        if(y1==0)
+            i++;
+        else
+        {
+            while(y1)
+            {
+                y1=y1/10;
+                i++;
+            }
+        }
+        TX_16(i);
+        for(x=0;x<i;x++)
+        {
+            TX_8((char)((y2/(pow(10,i-1-x)))+0x30));
+            y2=y2%((int32_t)(pow(10,i-1-x)));
+        }
+    }
+    else
+    {
+        y2=-y1;
+        while(-y1)
+        {
+            y1=y1/10;
+            i++;
+        }
+        TX_16(i+1);
+        for(x=0;x<i+1;x++)
+        {
+            if(x==0)
+                TX_8(0x2d);
+            else
+            {
+                TX_8((char)((y2/(pow(10,i-x)))+0x30));
+                y2=y2%((int32_t)(pow(10,i-x)));
+            }
+        }
+    }
+}
+
+void BatchSetTextFloat(int control_id,double value,int Digits)
+{
+    uint16_t  i = 0, length = 0;
+    uint32_t  data;
+    double     data1;
+
+    TX_16(control_id);
+    data1 = value;
+    if(value < 0)
+    {
+        value = -value;
+    }
+    value *= (float)pow(10, Digits);
+    data = (uint32_t)(int32_t)value;
+
+    if(data == 0)
+        length = 1;
+    else
+    {
+        while(data)
+        {
+            data /= 10;
+            length++;
+        }
+    }
+    data = (uint32_t)(int32_t)value;
+    if(length > Digits)
+    {
+        if(data1<0)
+        {
+                TX_16(length + 2);
+                TX_8(0x2D);
+        }
+        else
+        {
+                TX_16(length + 1);
+        }
+        for(i = 0; i < length + 1; i++)
+        {
+            if(i < (length - Digits))
+            {
+                TX_8(0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, length - i - 1)) % 10));
+            }
+            else  if(i == (length - Digits))
+                TX_8(0x2e);
+            else
+            {
+                TX_8(0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, length - i)) % 10));
+            }
+        }
+    }
+    else
+    {
+        if(data1<0)
+        {
+                TX_16(Digits + 3);
+                TX_8(0x2D);
+        }
+        else
+        {
+                TX_16(Digits + 2);
+        }
+        for(i = 0; i < Digits + 2; i++)
+        {
+            if(i == 0)          TX_8(0x30);
+            else  if(i == 1)    TX_8(0x2e);
+            else                TX_8(0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, Digits + 1 - i)) % 10));
+        }
+    }
+}
+
+
+void BatchSetTextDouble(uint16_t control_id,double value,uint16_t Digits)
+{
+    uint16_t  i = 0, length = 0;
+    uint32_t  data;
+    float     data1;
+
+    if(value < 0)
+    {
+        value = value - 0.00001;
+    }
+    else
+    {
+        value = value + 0.00001;
+    }
+
+
+    TX_16(control_id);
+    data1=(float)value;
+    if(value < 0)
+    {
+        value = -value;
+    }
+    value *= (float)pow(10, Digits);
+    data = (uint32_t)(int32_t)value;
+
+    if(data == 0)
+        length = 1;
+    else
+    {
+        while(data)
+        {
+            data /= 10;
+            length++;
+        }
+    }
+    data = (uint32_t)(int32_t)value;
+    if(length > Digits)
+    {
+        if(data1<0)
+        {
+                TX_16(length + 2);
+                TX_8(0x2D);
+        }
+        else
+        {
+                TX_16(length + 1);
+        }
+        for(i = 0; i < length + 1; i++)
+        {
+            if(i < (length - Digits))
+            {
+                TX_8(0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, length - i - 1)) % 10));
+            }
+            else  if(i == (length - Digits))
+                TX_8(0x2e);
+            else
+            {
+                TX_8(0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, length - i)) % 10));
+            }
+        }
+    }
+    else
+    {
+        if(data1<0)
+        {
+                TX_16(Digits + 3);
+                TX_8(0x2D);
+        }
+        else
+        {
+                TX_16(Digits + 2);
+        }
+        for(i = 0; i < Digits + 2; i++)
+        {
+            if(i == 0)          TX_8(0x30);
+            else  if(i == 1)    TX_8(0x2e);
+            else                TX_8(0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, Digits + 1 - i)) % 10));
+        }
+    }
+}
+
+
+void BatchSetFrame(uint16_t control_id,uint16_t frame_id)
+{
+    TX_16(control_id);
+    TX_16(2);
+    TX_16(frame_id);
+}
+
+/*!
+*  \brief     批量设置控件可见
+*  \param  control_id 控件ID
+*  \param  visible 帧ID  1显示  0隐藏
+*/
+void BatchSetVisible(uint16_t control_id,uint8_t visible)
+{
+    TX_16(control_id);
+    TX_8(1);
+    TX_8(visible);
+}
+/*!
+*  \brief     批量设置控件使能
+*  \param  control_id 控件ID
+*  \param  enable 帧ID
+*/
+void BatchSetEnable(uint16_t control_id,uint8_t enable)
+{
+    TX_16(control_id);
+    TX_8(2);
+    TX_8(enable);
+}
+
+void BatchEnd()
+{
+    END_CMD();
+}
+
+void SeTimer(uint16_t screen_id,uint16_t control_id,uint32_t timeout)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x40);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_32(timeout);
+    END_CMD();
+}
+
+void StartTimer(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x41);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void StopTimer(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x42);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void PauseTimer(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x44);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void SetControlBackLucency(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x17);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void SetControlBackColor(uint16_t screen_id,uint16_t control_id,uint16_t color)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x18);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_16(color);
+    END_CMD();
+}
+
+void SetControlForeColor(uint16_t screen_id,uint16_t control_id,uint16_t color)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x19);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_16(color);
+    END_CMD();
+}
+
+void ShowPopupMenu(uint16_t screen_id,uint16_t control_id,uint8_t show,uint16_t focus_control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x13);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_8(show);
+    TX_16(focus_control_id);
+    END_CMD();
+}
+
+void ShowKeyboard(uint8_t show,uint16_t x,uint16_t y,uint8_t type,uint8_t option,uint8_t max_len)
+{
+    BEGIN_CMD();
+    TX_8(0x86);
+    TX_8(show);
+    TX_16(x);
+    TX_16(y);
+    TX_8(type);
+    TX_8(option);
+    TX_8(max_len);
+    END_CMD();
+}
+
+void SetTextValueTime(uint16_t screen_id, uint16_t control_id,uint32_t value)
+{
+    uint8_t buffer[50] = {0},zz[50] = {0},length=0;
+    uint32_t data;
+
+    data = value;
+    if(value==0)
+    {
+        buffer[0] = 0x30;
+        buffer[1] = 0x30;
+    }
+    else if(value > 0)
+    {
+        while(value)
+        {
+            data/=10;
+            length++;
+        }
+        if(length==1)
+        {
+            sprintf((char *)zz,"%ld",(long)value); //把整数转换为字符串
+            buffer[0] = 0x30;
+            buffer[1] = zz[0];
+        }
+        else if(length==2)
+        {
+            sprintf((char *)buffer,"%ld",(long)value); //把整数转换为字符串
+        }
+    }
+    SetTextValue(screen_id,control_id,buffer);
+}
+
+
+void SetTextValueInt32(uint16_t screen_id, uint16_t control_id,int32_t value)
+{
+    uint8_t buffer[12] = {0};
+    sprintf((char *)buffer,"%ld",(long)value); //把整数转换为字符串
+    SetTextValue(screen_id,control_id,buffer);
+}
+
+void SetTextValueFloat(uint16_t screen_id, uint16_t control_id,float value,uint16_t Digits)
+{
+    uint8_t buffer[255] = {0},length=0,i=0,y=0;
+    uint32_t data;
+
+    if(value<0)
+    {
+        buffer[y++] = 0x2D;
+        value=-value;
+    }
+    value *= (float)pow(10,Digits);
+    data = (uint32_t)(int32_t)value;
+
+    if(data==0)
+        length=1;
+    else
+    {
+        while(data)
+        {
+            data/=10;
+            length++;
+        }
+    }
+    data = (uint32_t)(int32_t)value;
+    if(length > Digits)
+    {
+        for(i = 0; i < length + 1; i++)
+        {
+            if(i < (length - Digits))
+            {
+                buffer[y++] = 0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, length - i - 1)) % 10);
+            }
+            else  if(i == (length - Digits))
+                buffer[y++] = 0x2e;
+            else
+            {
+                buffer[y++] = 0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, length - i)) % 10);
+            }
+        }
+    }
+    else
+    {
+        for(i = 0; i < Digits + 2; i++)
+        {
+            if(i == 0)
+                buffer[y++] = 0x30;
+            else  if(i == 1)
+                buffer[y++] = 0x2e;
+            else
+                buffer[y++] = 0x30 | (uint8_t)(uint32_t)((data / (uint32_t)pow(10, Digits + 1 - i)) % 10);
+        }
+    }
+    SetTextValue(screen_id,control_id,buffer);
+}
+
+void SetAutoLight(uint8_t Switch,uint16_t upp,uint16_t low,uint16_t sleep_time)
+{
+    uint8_t set_u,set_l;
+    set_u = (uint8_t)(uint16_t)(uint32_t)(int32_t)(((float)upp/100)*255);
+    set_l = (uint8_t)(uint16_t)(uint32_t)(int32_t)(((float)low/100)*255);
+    BEGIN_CMD();
+    TX_8(0x77);
+    if(Switch)  TX_8(0x03);
+    else        TX_8(0);
+    TX_8(set_u);
+    TX_8(set_l);
+    TX_16(sleep_time);
+    END_CMD();
+}
+
+void AddTextInt32(int32_t value)
+{
+    int32_t y1,y2,i=0,x;
+
+    y1=value;
+    if(y1>=00)
+    {
+        y2=y1;
+        if(y1==0)
+            i++;
+        else
+        {
+            while(y1)
+            {
+                y1=y1/10;
+                i++;
+            }
+        }
+        for(x=0;x<i;x++)
+        {
+            TX_8((char)((y2/(pow(10,i-1-x)))+0x30));
+            y2=y2%((int32_t)(pow(10,i-1-x)));
+        }
+    }
+    else
+    {
+        y2=-y1;
+        while(-y1)
+        {
+            y1=y1/10;
+            i++;
+        }
+        for(x=0;x<i+1;x++)
+        {
+            if(x==0)
+                TX_8(0x2d);
+            else
+            {
+                TX_8((char)((y2/(pow(10,i-x)))+0x30));
+                y2=y2%((int32_t)(pow(10,i-x)));
+            }
+        }
+    }
+}
+
+void AddTextFloat(float value,uint16_t Digits)
+{
+    uint16_t  i = 0, length = 0;
+    uint32_t  data;
+
+    if(value < 0)
+    {
+        TX_8(0x2D);
+        value = -value;
+    }
+    value *= (float)pow(10, Digits);
+    data = (uint32_t)(int32_t)value;
+
+    if(data == 0)length = 1;
+    else
+    {
+        while(data)
+        {
+            data /= 10;
+            length++;
+        }
+    }
+    data = (uint32_t)(int32_t)value;
+    if(length > Digits)
+    {
+        for(i = 0; i < length + 1; i++)
+        {
+            if(i < (length - Digits))
+                TX_8(0x30|(uint8_t)(uint32_t)((data/(uint32_t)pow(10,length-i-1))%10));
+            else  if(i == (length - Digits))
+                TX_8(0x2e);
+            else
+                TX_8(0x30|(uint8_t)(uint32_t)((data/(uint32_t)pow(10,length-i))%10));
+        }
+    }
+    else
+    {
+        for(i = 0; i < Digits + 2; i++)
+        {
+            if(i == 0)        TX_8(0x30);
+            else  if(i == 1)  TX_8(0x2e);
+            else              TX_8(0x30 | (uint8_t)(uint32_t)((data/(uint32_t)pow(10,Digits+1-i))%10));
+        }
+    }
+}
+
+void AddCalData(uint16_t screen_id,uint16_t control_id,uint16_t point,float Value,float Signal)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x52);
+    TX_16(screen_id);
+    TX_16(control_id);
+    AddTextInt32(g_hmi.para.hmi_time.year);
+    TX_8(0x2D);
+    AddTextInt32(g_hmi.para.hmi_time.month);
+    TX_8(0x2D);
+    AddTextInt32(g_hmi.para.hmi_time.date);
+    TX_8(0x20);
+    AddTextInt32(g_hmi.para.hmi_time.hour);
+    TX_8(0x3A);
+    AddTextInt32(g_hmi.para.hmi_time.min);
+    TX_8(0x3A);
+    AddTextInt32(g_hmi.para.hmi_time.sec);
+    TX_8(0x3B);
+    if(point==0)            //Single
+    {
+        TX_8(0x53);
+        TX_8(0x69);
+        TX_8(0x6E);
+        TX_8(0x67);
+        TX_8(0x6C);
+        TX_8(0x65);
+    }
+    else if(point==1)      //Zero
+    {
+        TX_8(0x5A);
+        TX_8(0x65);
+        TX_8(0x72);
+        TX_8(0x6F);
+    }
+    else if(point==2)      //Span
+    {
+        TX_8(0x53);
+        TX_8(0x70);
+        TX_8(0x61);
+        TX_8(0x6E);
+    }
+    TX_8(0x3B);
+    AddTextFloat(Value,2);
+    TX_8(0x3B);
+    AddTextFloat(Signal,1);
+    END_CMD();
+}
+
+void Clear_History_Data(uint16_t screen_id,uint16_t control_id)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x53);
+    TX_16(screen_id);
+    TX_16(control_id);
+    END_CMD();
+}
+
+void History_Data_Display(uint16_t screen_id,uint16_t control_id,uint8_t *send_data)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x52);
+    TX_16(screen_id);
+    TX_16(control_id);
+    SendStrings(send_data);
+    END_CMD();
+}
+
+/*
+ * 说明：历史数据曲线修改数值显示范围
+ */
+void Historical_curve_range(uint16_t screen_id,uint16_t control_id, int upp ,int low)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x64);
+    TX_16(screen_id);
+    TX_16(control_id);
+    TX_32(upp);
+    TX_32(low);
+    END_CMD();
+}
+
+/*
+ * 说明：历史数据趋势数据发送
+ */
+void HistoryGraph_Data_Dis(uint8_t screen_id, uint8_t control_id, uint8_t *data_pointer)
+{
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x60);
+    TX_16(screen_id);
+    TX_16(control_id);
+
+    //高字节在前
+    TX_8(*(data_pointer + 3));
+    TX_8(*(data_pointer + 2));
+    TX_8(*(data_pointer + 1));
+    TX_8(*(data_pointer));
+
+    END_CMD();
+}
+
+
+void restart_HMI(void)
+{
+    BEGIN_CMD();
+    TX_8(0x07);
+    TX_8(0x35);
+    TX_8(0x5A);
+    TX_8(0x53);
+    TX_8(0xA5);
+    END_CMD();
+}
+
+void QRCode_Set(uint16_t screen_id,uint16_t control_id,uint8_t *qr_imei)
+{
+    uint8_t qr_prefix[56]    =   "https://mini.cloridge.com/phone?deviceNo=";
+    BEGIN_CMD();
+    TX_8(0xB1);
+    TX_8(0x10);
+    TX_16(screen_id);
+    TX_16(control_id);
+    strcat((char *)qr_prefix,(char *)qr_imei);
+//  SendStrings(qr_prefix);
+    SendNuint8_t(qr_prefix,56);
+    END_CMD();
+}
+
+void hmi_time_Set(uint8_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t min, uint8_t sec)
+{
+    g_hmi.para.hmi_set_time.year = dec_to_hex(year);
+    g_hmi.para.hmi_set_time.month = dec_to_hex(month);
+    g_hmi.para.hmi_set_time.date = dec_to_hex(day);
+    g_hmi.para.hmi_set_time.hour = dec_to_hex(hour);
+    g_hmi.para.hmi_set_time.min = dec_to_hex(min);
+    g_hmi.para.hmi_set_time.sec = dec_to_hex(sec);
+
+    BEGIN_CMD();  //0xEE
+    TX_8(0x81);   //0x81
+    TX_8(g_hmi.para.hmi_set_time.sec);
+    TX_8(g_hmi.para.hmi_set_time.min);
+    TX_8(g_hmi.para.hmi_set_time.hour);
+    TX_8(g_hmi.para.hmi_set_time.date);
+    TX_8(0x00);
+    TX_8(g_hmi.para.hmi_set_time.month);
+    TX_8(g_hmi.para.hmi_set_time.year);
+    END_CMD();     //0xFF FC FF FF
+}
+
+/*************************   串口屏驱动   *************************/
+
+/*************************  串口指令队列 *************************/
+typedef struct _QUEUE
+{
+    qsize _head; //队列头
+    qsize _tail;  //队列尾
+    qdata _data[QUEUE_MAX_SIZE];    //队列数据缓存区
+}QUEUE;
+
+static QUEUE que =
+{
+     ._head = 0,
+     ._tail = 0,
+     ._data = {0}
+};
+static uint32_t      cmd_state = 0;  //队列帧尾检测状态
+static qsize         cmd_pos = 0;    //当前指令指针位置
+
+void queue_reset()
+{
+    que._head = que._tail = 0;
+    cmd_pos = 0;
+    cmd_state = 0;
+}
+
+void queue_push(qdata _data)
+{
+    qsize pos = (unsigned short)((que._head+1)%QUEUE_MAX_SIZE);
+    if(pos!=que._tail)//非满状态
+    {
+        que._data[que._head] = _data;
+        que._head = pos;
+    }
+}
+
+void queue_push_multi(qdata *_data,uint8_t len)
+{
+    for(uint8_t i = 0;i<len;i++)
+    {
+        qsize pos = (unsigned short)((que._head+1)%QUEUE_MAX_SIZE);
+        if(pos!=que._tail)//非满状态
+        {
+            que._data[que._head] = *_data;
+            que._head = pos;
+            _data++;
+        }
+    }
+}
+
+//从队列中取一个数据
+static void queue_pop(qdata* _data)
+{
+    if(que._tail!=que._head)//非空状态
+    {
+        *_data = que._data[que._tail];
+        que._tail = (unsigned short)((que._tail+1)%QUEUE_MAX_SIZE);
+    }
+}
+
+//获取队列中有效数据个数
+static qsize queue_size()
+{
+    return (unsigned short)((que._head+QUEUE_MAX_SIZE-que._tail)%QUEUE_MAX_SIZE);
+}
+
+qsize queue_find_cmd(qdata *buffer,qsize buf_len)
+{
+    qsize cmd_size = 0;
+    qdata _data = 0;
+    while(queue_size()>0)
+    {
+        //取一个数据
+        queue_pop(&_data);
+
+        if(cmd_pos==0&&_data!=CMD_HEAD)//指令第一个字节必须是帧头，否则跳过
+            continue;
+
+        if(cmd_pos<buf_len)//防止缓冲区溢出
+            buffer[cmd_pos++] = _data;
+
+        cmd_state = ((cmd_state<<8)|_data);//拼接最后4个字节，组成一个32位整数
+
+        //最后4个字节与帧尾匹配，得到完整帧
+        if(cmd_state==CMD_TAIL)
+        {
+            cmd_size = cmd_pos; //指令字节长度
+            cmd_state = 0;  //重新检测帧尾巴
+            cmd_pos = 0; //复位指令指针
+
+#if(CRC16_ENABLE)
+            //去掉指令头尾EE，尾FFFCFFFF共计5个字节，只计算数据部分CRC
+            if(!CheckCRC16(buffer+1,cmd_size-5))//CRC校验
+                return 0;
+
+            cmd_size -= 2;//去掉CRC16（2字节）
+#endif
+
+            return cmd_size;
+        }
+    }
+
+    return 0;//没有形成完整的一帧
+}
+/*************************  串口指令队列 *************************/
+
+/*************************  消息处理流程 *************************/
+/*
+ * 说明：串口屏收到的数据处理
+ * 输入：无
+ * 输出：是否有控件操作
+ */
+uint8_t ProcessMessage(PCTRL_MSG msg)
+{
+    uint8_t control_operation = 0;
+
+    uint8_t cmd_type = msg->cmd_type;//指令类型
+//    uint8_t ctrl_msg = msg->ctrl_msg;   //消息的类型
+    uint8_t control_type = msg->control_type;//控件类型
+//    uint16_t screen_id = PTR2uint16_t(&msg->screen_id);//画面ID
+//    uint16_t control_id = PTR2uint16_t(&msg->control_id);//控件ID
+//    uint32_t value = PTR2uint32_t(msg->param);//数值
+
+    //赋值转接
+    g_page.cmd_type = msg->cmd_type;                            //指令类型
+    g_page.ctrl_msg = msg->ctrl_msg;                            //消息的类型
+    g_page.control_type = msg->control_type;                    //控件类型
+    g_page.screen_id = PTR2uint16_t(&msg->screen_id);            //画面ID
+    g_page.control_id = PTR2uint16_t(&msg->control_id);          //控件ID
+    g_page.value =  PTR2uint32_t(msg->param);                   //数值
+    g_page.param_addr = msg->param;                             //数组引用
+
+    if(cmd_type == NOTIFY_CONTROL)
+    {
+        if(control_type == kCtrlButton || control_type == kCtrlText  || control_type == kCtrlMenu)//按钮，文本，菜单
+            control_operation = 1;
+    }
+
+    if(msg->ctrl_msg == MSG_GET_CARTOON)
+    {
+        control_operation = 1;
+    }
+
+    switch(cmd_type)
+    {
+    case NOTIFY_READ_RTC://读取RTC时间
+        NotifyReadRTC(cmd_buffer[2],cmd_buffer[3],cmd_buffer[4],cmd_buffer[5],cmd_buffer[6],cmd_buffer[7],cmd_buffer[8]);
+        break;
+
+    default:
+        break;
+    }
+
+    return control_operation;
+}
+
+/*!
+ *  \brief      画面切换通知
+ *  \details    当前画面改变时(或调用GetScreen)，执行此函数
+ *  \param      screen_id 当前画面ID
+ */
+__WEAK void NotifyScreen(uint16_t screen_id)
+{
+    FSP_PARAMETER_NOT_USED(screen_id);
+}
+
+/*!
+// *  \brief  触摸坐标事件响应
+// *  \param  press 1按下触摸屏，3松开触摸屏
+// *  \param  x           x坐标
+// *  \param  y           y坐标
+// */
+//__WEAK void NotifyTouchXY(uint8_t press,uint16_t x,uint16_t y)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief      按钮控件通知
+// *  \details    当按钮状态改变(或调用GetControlValue)时，执行此函数
+// *  \param      screen_id       画面ID
+// *  \param      control_id  控件ID
+// *  \param      state               按钮状态：0弹起，1按下
+// */
+//__WEAK void NotifyButton(uint16_t screen_id, uint16_t control_id, uint8_t  state)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief      文本控件通知
+// *  \details    当文本通过键盘更新(或调用GetControlValue)时，执行此函数
+// *  \param      screen_id       画面ID
+// *  \param      control_id  控件ID
+// *  \param      str                 文本控件内容
+// */
+//__WEAK void NotifyText(uint16_t screen_id, uint16_t control_id, uint8_t *str)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief      进度条控件通知
+// *  \details    调用GetControlValue时，执行此函数
+// *  \param      screen_id       画面ID
+// *  \param      control_id  控件ID
+// *  \param      value               值
+// */
+//__WEAK void NotifyProgress(uint16_t screen_id, uint16_t control_id, uint32_t value)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief      滑动条控件通知
+// *  \details  当滑动条改变(或调用GetControlValue)时，执行此函数
+// *  \param      screen_id       画面ID
+// *  \param      control_id  控件ID
+// *  \param      value               值
+// */
+//__WEAK void NotifySlider(uint16_t screen_id, uint16_t control_id, uint32_t value)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief      仪表控件通知
+// *  \details    调用GetControlValue时，执行此函数
+// *  \param      screen_id       画面ID
+// *  \param      control_id  控件ID
+// *  \param      value               值
+// */
+//__WEAK void NotifyMeter(uint16_t screen_id, uint16_t control_id, uint32_t value)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief      菜单控件通知
+// *  \details    当菜单项按下或松开时，执行此函数
+// *  \param      screen_id       画面ID
+// *  \param      control_id  控件ID
+// *  \param      item                菜单项索引
+// *  \param      state               按钮状态：0松开，1按下
+// */
+//__WEAK void NotifyMenu(uint16_t screen_id, uint16_t control_id, uint8_t  item, uint8_t  state)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief      选择控件通知
+// *  \details    当选择控件变化时，执行此函数
+// *  \param      screen_id       画面ID
+// *  \param      control_id  控件ID
+// *  \param      item                当前选项
+// */
+//__WEAK void NotifySelector(uint16_t screen_id, uint16_t control_id, uint8_t  item)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief  定时器超时通知处理
+// *  \param  screen_id       画面ID
+// *  \param  control_id  控件ID
+// */
+//__WEAK void NotifyTimer(uint16_t screen_id, uint16_t control_id)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief  动画控件通知
+// *  \param  screen_id       画面ID
+// *  \param  control_id  控件ID
+// */
+//__WEAK void NotifyCartoon(uint16_t screen_id, uint16_t control_id)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief  读取用户FLASH状态返回
+// *  \param  status  0失败，1成功
+// *  \param  _data       返回数据
+// *  \param  length  数据长度
+// */
+//__WEAK void NotifyReadFlash(uint8_t status,uint8_t *_data,uint16_t length)
+//{
+//    //TODO: 添加用户代码
+//}
+//
+///*!
+// *  \brief  写用户FLASH状态返回
+// *  \param  status 0失败，1成功
+// */
+//__WEAK void NotifyWriteFlash(uint8_t status)
+//{
+//    //TODO: 添加用户代码
+//}
+
+/*!
+ *  \brief  读取RTC时间，注意返回的是BCD码
+ *  \param  year        年（BCD）
+ *  \param  month       月（BCD）
+ *  \param  week        星期（BCD）
+ *  \param  day         日（BCD）
+ *  \param  hour        时（BCD）
+ *  \param  minute  分（BCD）
+ *  \param  second  秒（BCD）
+ */
+__WEAK void NotifyReadRTC(uint8_t year,uint8_t month,uint8_t week,uint8_t day,uint8_t hour,uint8_t minute,uint8_t second)
+{
+    g_hmi.para.hmi_time.year = (uint8_t)((year>>4)*10 + (year&0x0F));
+    g_hmi.para.hmi_time.month = (uint8_t)((month>>4)*10 + (month&0x0F));
+    g_hmi.para.hmi_time.week = (uint8_t)week;
+    g_hmi.para.hmi_time.date = (uint8_t)((day>>4)*10 + (day&0x0F));
+    g_hmi.para.hmi_time.hour = (uint8_t)((hour>>4)*10 + (hour&0x0F));
+    g_hmi.para.hmi_time.min = (uint8_t)((minute>>4)*10 + (minute&0x0F));
+    g_hmi.para.hmi_time.sec = (uint8_t)((second>>4)*10 + (second&0x0F));
+}
+
+/*!
+ *  \brief  自动背光调节模式下，背光变化通知
+ *  \param  state   状态
+ */
+__WEAK void NotifyLightState(uint8_t state)
+{
+    //TODO: 添加用户代码
+    FSP_PARAMETER_NOT_USED (state);
+}
+/*************************  消息处理流程 *************************/
+
+/************************数据接收中断函数*************************/
+void hmi_uart_IRQHandler(void)
+{
+    uint16_t i;
+
+    if(hmi_rx_len<5)
+    {
+        hmi_uart_init();
+    }
+    else
+    {
+        for(i=0;i<hmi_rx_len;i++)
+        {
+            queue_push(HMI_rxChar[i]);//入队
+        }
+    }
+    memset(HMI_rxChar,0,sizeof(HMI_rxChar));
+    hmi_rx_len=0;
+}
+/*************************User Code Begin*************************/
+/*************************************************************
+ * Function Name : hmi_timer_callback
+ * Description : 屏幕接收中断函数
+ * Input : 无
+ * Output : 无
+ * Return ： 无
+ *************************************************************/
+/* Callback function */
+void g_timer1_AGT_5ms_callback(timer_callback_args_t *p_args)/* Callback function */
+{
+    /* TODO: add your own code here */
+    if(p_args->event==TIMER_EVENT_CYCLE_END)
+    {
+        if(hmi_rx_len)
+        {
+            hmi_rx_flag++;
+            if(hmi_rx_flag > 1)
+            {
+                hmi_uart_IRQHandler();
+            }
+        }
+    }
+}
+
+/*************************************************************
+ * 说明 : 屏幕串口接收中断函数
+ * Input : 中断
+ * Output : 无
+ * Return ： 无
+ *************************************************************/
+/* Callback function */
+void uart3_dis_callback(uart_callback_args_t *p_args)
+{
+    /* TODO: add your own code here */
+    switch (p_args->event)
+   {
+       case UART_EVENT_TX_COMPLETE:
+       {
+           hmi_tx_flag = 1;
+       }
+       break;
+
+       case UART_EVENT_RX_CHAR:
+       {
+           HMI_rxChar[hmi_rx_len++] = (uint8_t)(p_args->data);
+           if(hmi_rx_len > QUEUE_MAX_SIZE)
+               hmi_rx_len = QUEUE_MAX_SIZE;
+           hmi_rx_flag = 0;
+       }
+       break;
+       case UART_EVENT_RX_COMPLETE:  // 暂时无用，触发不了
+       {
+          ;
+       }
+       break;
+       default: break;
+   }
+}
+
+/**************************User Code End**************************/
+/*
+ * 说明：功能层，串口屏使用的初始化函数
+ * 输入：无
+ * 输出：无
+ */
+void funcation_hmi_init(void)
+{
+    hmi_enable_power();
+    hmi_enable_uart();
+    hmi_uart_init();
+    hmi_timer_init();
+}
+
+
